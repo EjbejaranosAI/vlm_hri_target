@@ -1,0 +1,32 @@
+# Entorno virtual (lo crea setup.sh, no se versiona)
+.venv/
+venv/
+
+# Cache de Python
+__pycache__/
+*.pyc
+
+# Cache de HuggingFace / matplotlib / Ultralytics (se regenera solo)
+.hf_cache/
+.mplconfig/
+Ultralytics/
+
+# Pesos de modelos (se descargan solos en el primer uso)
+*.pt
+*.pth
+*.safetensors
+
+# Resultados generados (videos anotados, JSON, CSV) — no son código
+output/
+output_*/
+*.mp4
+*.avi
+*.mov
+
+# Videos de entrada: cada quien pone los suyos, no se versionan
+# (varios de los que usamos en pruebas son stock footage con licencia)
+input_videos/*
+!input_videos/.gitkeep
+
+# Sistema
+.DS_Store

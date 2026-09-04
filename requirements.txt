@@ -1,0 +1,11 @@
+torch>=2.1.0
+torchvision
+ultralytics
+transformers>=4.45.0
+accelerate
+bitsandbytes
+qwen-vl-utils
+pillow
+opencv-python-headless
+numpy
+pandas
