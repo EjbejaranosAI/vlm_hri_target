@@ -30,7 +30,6 @@ import numpy as np
 from ultralytics import YOLO
 
 from .. import preview as stream_preview, video_io
-from ..actions import normalize_action
 from ..config import (
     MAX_TRACK_IDS,
     POSE_YOLO_WEIGHTS,
@@ -51,7 +50,7 @@ from ..detection import (
     track_detections,
     warmup_yolo,
 )
-from ..drawing import annotate_for_vlm, draw_banner_video, draw_box, format_detection_label, social_box_color, ui_scale
+from ..drawing import annotate_for_vlm, draw_banner_video, draw_box, format_detection_label, ui_scale
 from ..motion import refine_chunk_labels
 from ..pose import gait as pose_gait
 from ..social_state import SOCIAL_UNKNOWN, social_state_mode, social_states_from_actions
@@ -119,31 +118,23 @@ class StreamState:
     frames_done: int = 0
 
 
-def _write_chunk_video(
-    frames: list[np.ndarray], path: Path, fps: float, size: tuple[int, int]
-) -> bool:
-    w, h = size
-    writer = cv2.VideoWriter(
-        str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
-    )
-    for fr in frames:
-        writer.write(fr)
-    writer.release()
-    return path.is_file() and path.stat().st_size > 0
+_write_chunk_video = video_io.write_chunk_video
 
 
 def _submit_chunk(
     queue: Queue, job: VlmChunkJob, output: StreamOutput | None = None
 ) -> None:
-    """Cola acotada: si está llena, escribe el trozo más antiguo (etiquetas actuales) y lo quita."""
-    while queue.full():
-        try:
-            old = queue.get_nowait()
-            if output is not None and old.display_frames:
-                _flush_chunk_to_output(old, output)
-        except Empty:
-            break
-    queue.put(job)
+    """Cola acotada: si está llena, escribe el trozo más antiguo (etiquetas actuales) y lo quita.
+
+    Wrapper fino sobre video_io.submit_chunk (genérico, compartido con
+    pose_session.py) que reconstruye el comportamiento exacto de antes para
+    el job "plano" (VlmChunkJob/display_frames)."""
+
+    def _on_evict(old: VlmChunkJob) -> None:
+        if output is not None and old.display_frames:
+            _flush_chunk_to_output(old, output)
+
+    video_io.submit_chunk(queue, job, on_evict=_on_evict)
 
 
 def _render_output_frame(
@@ -764,13 +755,9 @@ def _run_all_plain(
     return outs
 
 
-@dataclass
-class RawFrame:
-    """Frame crudo + detecciones (con keypoints) tal cual salen de Fase 1,
-    ANTES de saber azul/rojo (eso solo se sabe al cerrar el trozo)."""
-    frame_i: int
-    frame_bgr: np.ndarray
-    dets: list[dict]
+
+
+from .pose_session import PoseStreamSession, RawFrame, VideoFileSink, render_pose_frame
 
 
 def _scaled_raw_frame(rf: RawFrame, factor: float) -> RawFrame:
@@ -801,229 +788,6 @@ def _scaled_raw_frame(rf: RawFrame, factor: float) -> RawFrame:
     return RawFrame(rf.frame_i, frame, dets)
 
 
-@dataclass
-class _PoseStreamOutput:
-    writer: cv2.VideoWriter
-    lock: threading.Lock
-    live_preview: stream_preview.LivePreview | None
-    w: int
-    h: int
-    fps: float
-    chunk_sec: float
-    t_pipeline0: float
-    state: _PoseStreamState
-    draw_pose: bool = False
-
-
-@dataclass
-class _PoseVlmChunkJob:
-    chunk_index: int
-    start_frame: int
-    raw_frames: list[RawFrame]
-    person_ids: list[int]
-    out_path: Path
-    fps: float
-    size: tuple[int, int]
-
-
-@dataclass
-class _PoseStreamState:
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    actions: dict[int, str] = field(default_factory=dict)
-    social_states: dict[int, str] = field(default_factory=dict)
-    segment_actions: list[tuple[int, dict[int, str]]] = field(default_factory=list)
-    segment_social: list[tuple[int, dict[int, str]]] = field(default_factory=list)
-    vlm_chunk_timings: list[dict] = field(default_factory=list)
-    vlm_total_s: float = 0.0
-    vlm_calls: int = 0
-    vlm_pending: bool = False
-    yolo_total_s: float = 0.0
-    frames_done: int = 0
-
-
-def _render_output_frame_pose(
-    rf: RawFrame,
-    actions: dict[int, str],
-    social_states: dict[int, str],
-    *,
-    w: int,
-    h: int,
-    fps: float,
-    chunk_sec: float,
-    chunk_index: int,
-    chunk_count: int,
-    yolo_total_s: float,
-    vlm_total_s: float,
-    vlm_calls: int,
-    pipeline_total_s: float,
-    vlm_pending: bool,
-    draw_pose: bool = False,
-) -> np.ndarray:
-    """Video final para el usuario (no el que ve el VLM): caja de color + ID +
-    panel lateral + resalte del target — igual estilo que run_video_pose.py.
-    `draw_pose=True`: superpone además el esqueleto COCO-17 (visualización)."""
-    ann = rf.frame_bgr.copy()
-    target_pid = pose_gait.pick_interaction_target(
-        rf.dets, {d["pid"]: social_states.get(d["pid"]) for d in rf.dets}
-    )
-    panel_entries: list[tuple[int, str, tuple[int, int, int], bool]] = []
-    for d in rf.dets:
-        social_state = social_states.get(d["pid"])
-        color = social_box_color(social_state)
-        pose_gait.draw_box_only(ann, d["x1"], d["y1"], d["x2"], d["y2"], d["pid"], color)
-        if draw_pose:
-            pose_gait.draw_pose_skeleton(ann, d.get("kpts"))
-        act = normalize_action(actions.get(d["pid"], ""))
-        state_txt = social_state or "UNKNOWN"
-        text = f"{state_txt} ({act})" if act and act != "unknown" else state_txt
-        is_target = d["pid"] == target_pid
-        if is_target:
-            cv2.rectangle(
-                ann, (d["x1"] - 3, d["y1"] - 3), (d["x2"] + 3, d["y2"] + 3),
-                (0, 255, 255), 2,
-            )
-        panel_entries.append((d["pid"], text, color, is_target))
-    pose_gait.draw_side_panel(ann, panel_entries)
-    draw_banner_video(
-        ann,
-        yolo_total_s=yolo_total_s,
-        n_frames=max(rf.frame_i, 1),
-        vlm_total_s=vlm_total_s,
-        vlm_calls=max(vlm_calls, 1),
-        n_people=len({d["pid"] for d in rf.dets}),
-        pipeline_total_s=pipeline_total_s,
-        frame_i=rf.frame_i,
-        vlm_input_kind="chunks",
-        chunk_sec=chunk_sec,
-        chunk_index=chunk_index,
-        chunk_count=chunk_count,
-    )
-    if vlm_pending:
-        cv2.putText(
-            ann, "VLM...",
-            (int(10 * ui_scale(h, w)), int(h - 30 * ui_scale(h, w))),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * ui_scale(h, w), (255, 200, 255), 1, cv2.LINE_8,
-        )
-    return ann
-
-
-def _flush_chunk_to_output_pose(job: _PoseVlmChunkJob, output: _PoseStreamOutput) -> None:
-    with output.state.lock:
-        actions = dict(output.state.actions)
-        social_states = dict(output.state.social_states)
-        yolo_acum = output.state.yolo_total_s
-        vlm_acum = output.state.vlm_total_s
-        vlm_n = output.state.vlm_calls
-        vlm_pending = output.state.vlm_pending
-    pipeline_now = time.perf_counter() - output.t_pipeline0
-    chunk_count = max(job.chunk_index + 1, vlm_n)
-    with output.lock:
-        for rf in job.raw_frames:
-            ann = _render_output_frame_pose(
-                rf, actions, social_states,
-                w=output.w, h=output.h, fps=output.fps, chunk_sec=output.chunk_sec,
-                chunk_index=job.chunk_index, chunk_count=chunk_count,
-                yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
-                pipeline_total_s=pipeline_now, vlm_pending=vlm_pending,
-                draw_pose=output.draw_pose,
-            )
-            output.writer.write(ann)
-            if output.live_preview is not None:
-                try:
-                    output.live_preview.write(ann)
-                except BrokenPipeError:
-                    pass
-
-
-def _vlm_worker_pose(
-    queue: Queue,
-    vlm,
-    processor,
-    state: _PoseStreamState,
-    stop: threading.Event,
-    output: _PoseStreamOutput | None,
-) -> None:
-    motion_hyst = pose_gait.MotionHysteresis()
-    while True:
-        if stop.is_set():
-            try:
-                job: _PoseVlmChunkJob = queue.get_nowait()
-            except Empty:
-                break
-        else:
-            try:
-                job = queue.get(timeout=0.25)
-            except Empty:
-                continue
-        with state.lock:
-            state.vlm_pending = True
-
-        buffer_dets = [rf.dets for rf in job.raw_frames]
-        pids = job.person_ids
-        gait = pose_gait.chunk_gait_by_pid(buffer_dets, pids)
-        depth = pose_gait.chunk_depth_motion_by_pid(buffer_dets, pids)
-        raw_moving = {p for p in pids if gait.get(p) or depth.get(p)}
-        moving_pids = motion_hyst.update(job.chunk_index, raw_moving, set(pids))
-
-        vlm_frames = [
-            pose_gait.annotate_for_vlm_pose(rf.frame_bgr, rf.dets, moving_pids) for rf in job.raw_frames
-        ]
-        dets_prompt = dets_for_vlm_prompt(buffer_dets, pids)
-
-        chunk_sec = len(vlm_frames) / max(job.fps, 1e-6)
-        t0 = time.perf_counter()
-        try:
-            if chunk_vlm_use_image(chunk_sec):
-                mid = vlm_frames[len(vlm_frames) // 2]
-                vlm_out = infer_actions_image(vlm, processor, mid, dets_prompt, already_annotated=True)
-            elif _write_chunk_video(vlm_frames, job.out_path, job.fps, job.size):
-                vlm_out = infer_actions_video(
-                    vlm, processor, job.out_path, pids, dets=dets_prompt, chunk_sec=chunk_sec
-                )
-            else:
-                mid = vlm_frames[len(vlm_frames) // 2]
-                vlm_out = infer_actions_image(vlm, processor, mid, dets_prompt, already_annotated=True)
-        except Exception as e:
-            print(f"  [VLM trozo {job.chunk_index}] error: {e}", flush=True)
-            vlm_out = VlmInferenceResult({}, {}, 0.0)
-
-        acts = dict(vlm_out.actions)
-        social = dict(vlm_out.social_states)
-        if pids:
-            # Misma lógica de refinamiento que el modo offline (run_video_pose.py):
-            # debias del sesgo grupal de "walking", forzado a caminar si hay
-            # evidencia independiente, respaldo por cinemática de caja
-            # (con compensación de movimiento de cámara), y ATTENTIVE por mirada.
-            acts, social = pose_gait.refine_labels_pose(
-                acts, social, buffer_dets, pids, job.size, moving_pids_hint=moving_pids
-            )
-            social = pose_gait.upgrade_attentive_by_gaze(social, buffer_dets, pids)
-
-        dt = time.perf_counter() - t0
-        with state.lock:
-            state.vlm_total_s += dt
-            state.vlm_calls += 1
-            state.vlm_pending = False
-            for pid, act in acts.items():
-                if act and act != "unknown":
-                    state.actions[pid] = act
-            for pid, st in social.items():
-                if st and st != SOCIAL_UNKNOWN:
-                    state.social_states[pid] = st
-            state.segment_actions.append((job.start_frame, dict(acts)))
-            state.segment_social.append((job.start_frame, dict(social)))
-            state.vlm_chunk_timings.append(
-                {"chunk_index": job.chunk_index, "start_frame": job.start_frame, "latency_s": round(vlm_out.elapsed_s, 4)}
-            )
-        if output is not None and job.raw_frames:
-            _flush_chunk_to_output_pose(job, output)
-        print(
-            f"  [VLM trozo {job.chunk_index}] f{job.start_frame}+ actions={acts} social={social} "
-            f"(inferencia {vlm_out.elapsed_s:.2f}s, acum VLM {state.vlm_total_s:.2f}s)",
-            flush=True,
-        )
-
-
 def _run_pose(
     *,
     video_path: Path | None = None,
@@ -1050,7 +814,6 @@ def _run_pose(
     out = Path(output_dir or _STREAM_OUTPUT_DIR_POSE) / out_name
     out.mkdir(parents=True, exist_ok=True)
     chunk_dir = out / "vlm_chunks"
-    chunk_dir.mkdir(exist_ok=True)
 
     if video_path is not None:
         video_path = video_io.ensure_opencv_video(Path(video_path))
@@ -1095,64 +858,20 @@ def _run_pose(
             warmup_vlm(vlm, processor)
         print(f"  VLM listo en {time.perf_counter() - t_load:.1f}s", flush=True)
 
-    state = _PoseStreamState()
-    stop = threading.Event()
     out_mp4 = out / "annotated_stream.mp4"
     writer = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    video_sink = VideoFileSink(writer=writer, lock=threading.Lock())
+    session = PoseStreamSession(
+        w=w, h=h, fps=fps, chunk_sec=chunk_sec, chunk_dir=chunk_dir,
+        vlm=vlm, processor=processor, draw_pose=draw_pose, sinks=[video_sink],
+    )
+    session.start()
+
     live_preview: stream_preview.LivePreview | None = None
     want_preview = preview
     preview_gave_up = False
-    t_pipeline0 = time.perf_counter()
-    writer_lock = threading.Lock()
-    stream_output = _PoseStreamOutput(
-        writer=writer, lock=writer_lock, live_preview=None,
-        w=w, h=h, fps=fps, chunk_sec=chunk_sec, t_pipeline0=t_pipeline0, state=state,
-        draw_pose=draw_pose,
-    )
-    vlm_queue: Queue = Queue(maxsize=8)
-    worker = threading.Thread(
-        target=_vlm_worker_pose, args=(vlm_queue, vlm, processor, state, stop, stream_output), daemon=True
-    )
-    worker.start()
 
     prev_dets: list[dict] = []
-    chunk_raw: list[RawFrame] = []
-    frame_i = 0
-    chunk_i = 0
-    next_chunk_at = chunk_frames
-
-    def submit_chunk() -> None:
-        nonlocal chunk_raw, chunk_i, next_chunk_at
-        if not chunk_raw:
-            return
-        all_pids = sorted({d["pid"] for rf in chunk_raw for d in rf.dets})
-        # Igual que runners/video.py: prioriza a quien está más cerca de la
-        # cámara (mayor área de caja), no a quien tiene el pid numérico más
-        # bajo -- antes este truncado por orden de pid siempre se quedaba con
-        # los primeros IDs asignados en la sesión, sin importar qué tan
-        # relevantes (cercanos) fueran.
-        ranking_rows = [
-            {"person_id": d["pid"], "x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"]}
-            for rf in chunk_raw
-            for d in rf.dets
-        ]
-        pids = pose_gait.closest_n_pids(ranking_rows, all_pids, pose_gait.MAX_VLM_PEOPLE)
-        _submit_chunk(
-            vlm_queue,
-            _PoseVlmChunkJob(
-                chunk_index=chunk_i,
-                start_frame=frame_i - len(chunk_raw),
-                raw_frames=list(chunk_raw),
-                person_ids=pids,
-                out_path=chunk_dir / f"chunk_{chunk_i:04d}.mp4",
-                fps=fps,
-                size=(w, h),
-            ),
-            stream_output,
-        )
-        chunk_i += 1
-        next_chunk_at += chunk_frames
-        chunk_raw = []
 
     try:
         while True:
@@ -1160,7 +879,7 @@ def _run_pose(
             ok, frame = cap.read()
             if not ok:
                 break
-            if max_frames is not None and frame_i >= max_frames:
+            if max_frames is not None and session.frame_i >= max_frames:
                 break
 
             frame = video_io._crop_frame(frame, w, h)
@@ -1170,22 +889,25 @@ def _run_pose(
             pose_raw = pose_gait.detect_people_pose(yolo_pose, frame)
             pose_gait.attach_pose_keypoints(dets, pose_raw)
 
-            chunk_raw.append(RawFrame(frame_i, frame.copy(), [dict(d) for d in dets]))
+            session.append_frame(frame.copy(), [dict(d) for d in dets])
 
             if display:
-                with state.lock:
-                    actions = dict(state.actions)
-                    social_states = dict(state.social_states)
-                    vlm_pending = state.vlm_pending
-                    yolo_acum, vlm_acum, vlm_n = state.yolo_total_s, state.vlm_total_s, state.vlm_calls
+                with session.state.lock:
+                    actions = dict(session.state.actions)
+                    social_states = dict(session.state.social_states)
+                    vlm_pending = session.state.vlm_pending
+                    yolo_acum, vlm_acum, vlm_n = (
+                        session.state.yolo_total_s, session.state.vlm_total_s, session.state.vlm_calls,
+                    )
                 try:
-                    disp_rf = _scaled_raw_frame(chunk_raw[-1], DISPLAY_SCALE)
+                    disp_rf = _scaled_raw_frame(session.chunk_raw[-1], DISPLAY_SCALE)
                     disp_h, disp_w = disp_rf.frame_bgr.shape[:2]
-                    display_ann = _render_output_frame_pose(
+                    display_ann = render_pose_frame(
                         disp_rf, actions, social_states,
-                        w=disp_w, h=disp_h, fps=fps, chunk_sec=chunk_sec, chunk_index=chunk_i, chunk_count=chunk_i + 1,
+                        w=disp_w, h=disp_h, fps=fps, chunk_sec=chunk_sec,
+                        chunk_index=session.chunk_i, chunk_count=session.chunk_i + 1,
                         yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
-                        pipeline_total_s=time.perf_counter() - t_pipeline0, vlm_pending=vlm_pending,
+                        pipeline_total_s=time.perf_counter() - session.t_pipeline0, vlm_pending=vlm_pending,
                         draw_pose=draw_pose,
                     )
                     cv2.imshow("stream-pose", display_ann)
@@ -1198,31 +920,23 @@ def _run_pose(
             if want_preview and not preview_gave_up:
                 if live_preview is None:
                     live_preview = stream_preview._open_live_preview(w, h, fps)
-                    stream_output.live_preview = live_preview
+                    video_sink.live_preview = live_preview
                     if live_preview is None:
                         preview_gave_up = True
                         want_preview = False
                 elif not live_preview.alive():
                     preview_gave_up = True
                     want_preview = False
-                    stream_output.live_preview = None
+                    video_sink.live_preview = None
                     print("  Ventana de vista previa cerrada; sigue el mp4 en disco.", flush=True)
 
             yolo_dt = time.perf_counter() - t_fr0
-            with state.lock:
-                state.yolo_total_s += yolo_dt
-                state.frames_done = frame_i + 1
-            frame_i += 1
-
-            if frame_i >= next_chunk_at and len(chunk_raw) >= chunk_frames:
-                submit_chunk()
+            session.tick(yolo_dt)
 
             if realtime and source == "video":
                 time.sleep(max(0.0, 1.0 / fps - (time.perf_counter() - t_fr0)))
     finally:
-        submit_chunk()
-        stop.set()
-        worker.join(timeout=300)
+        result = session.flush_and_stop()
         cap.release()
         writer.release()
         if live_preview is not None:
@@ -1231,17 +945,17 @@ def _run_pose(
             stream_preview._safe_destroy_windows()
 
     video_io.finalize_video_h264(out_mp4)
-    pipeline_total_s = time.perf_counter() - t_pipeline0
-
-    with state.lock:
-        segment_actions = list(state.segment_actions)
-        segment_social = list(state.segment_social)
-        vlm_chunk_timings = list(state.vlm_chunk_timings)
-        final_actions = dict(state.actions)
-        final_social = dict(state.social_states)
-        vlm_total_s = state.vlm_total_s
-        vlm_calls = state.vlm_calls
-        yolo_total_s = state.yolo_total_s
+    frame_i = result["frame_i"]
+    chunk_i = result["chunk_i"]
+    segment_actions = result["segment_actions"]
+    segment_social = result["segment_social"]
+    vlm_chunk_timings = result["vlm_chunk_timings"]
+    final_actions = result["final_actions"]
+    final_social = result["final_social"]
+    vlm_total_s = result["vlm_total_s"]
+    vlm_calls = result["vlm_calls"]
+    yolo_total_s = result["yolo_total_s"]
+    pipeline_total_s = time.perf_counter() - session.t_pipeline0
 
     rt = video_io._realtime_metrics(
         frames=frame_i, fps=fps, yolo_s=yolo_total_s, vlm_s=vlm_total_s,

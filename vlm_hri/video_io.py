@@ -8,8 +8,11 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Callable
 
 import cv2
+import numpy as np
 
 from .config import VIDEO_EXTS
 
@@ -368,3 +371,33 @@ def write_batch_summary(rows: list[dict], base_out: Path) -> Path:
     print(f"           {timing_csv}")
     print("=" * 60)
     return out_json
+
+
+def write_chunk_video(
+    frames: list[np.ndarray], path: Path, fps: float, size: tuple[int, int]
+) -> bool:
+    w, h = size
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    for fr in frames:
+        writer.write(fr)
+    writer.release()
+    return path.is_file() and path.stat().st_size > 0
+
+
+def submit_chunk(queue: Queue, job, on_evict: Callable[[object], None] | None = None) -> None:
+    """Cola acotada para trozos pendientes de VLM: si está llena, saca el más
+    antiguo y -- si `on_evict` está dado -- le da al llamador la oportunidad
+    de volcarlo a la salida con las etiquetas que haya hasta ahora, antes de
+    descartarlo (así no se pierde silenciosamente un trozo entero de video).
+
+    `on_evict` en vez de una llamada fija a una función de "flush" concreta:
+    los distintos runners (plano/pose) tienen tipos de job y funciones de
+    render distintas -- este helper es genérico sobre eso."""
+    while queue.full():
+        try:
+            old = queue.get_nowait()
+            if on_evict is not None:
+                on_evict(old)
+        except Empty:
+            break
+    queue.put(job)
