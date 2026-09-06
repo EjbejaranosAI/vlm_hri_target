@@ -4,7 +4,6 @@ H.264, escritura por ffmpeg-pipe, métricas de tiempo real y resumen batch.
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import subprocess
