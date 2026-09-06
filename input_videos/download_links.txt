@@ -2,11 +2,6 @@
 # Download with: wget -i download_links.txt -P input_videos/
 # or: xargs -n1 -a download_links.txt -I{} wget -P input_videos/ "{}"
 
-https://pixabay.com/videos/download/video-27091_medium.mp4
-https://pixabay.com/videos/download/video-198887_medium.mp4
-https://pixabay.com/videos/download/video-73531_large.mp4
-https://pixabay.com/videos/download/video-40818_medium.mp4
-https://pixabay.com/videos/download/video-39890_medium.mp4
 https://media.istockphoto.com/id/2150615549/es/v%C3%ADdeo/hombre-de-negocios-maduro-que-coopera-con-un-colega-joven.mp4?s=mp4-640x640-is&k=20&c=0nw_Y_5MvTj8bH1nAMfO2sQZv2TSgeIAZJf0PUzDSXE=
 https://media.istockphoto.com/id/1411852025/es/v%C3%ADdeo/empresarios-caminando-y-hablando-en-el-pasillo-de-la-oficina.mp4?s=mp4-640x640-is&k=20&c=14frKdS9EqOtFxl1SnhvS8WothuQbDsJJ1R7Bc12dRg=
 https://media.istockphoto.com/id/2285227271/es/v%C3%ADdeo/personas-de-alta-direcci%C3%B3n-colaborando-y-debatiendo-trabajo-usando-una-tableta-digital-en-una.mp4?s=mp4-480x480-is&k=20&c=eFWkF5O7HiD6_9vCe5xNWfXRFR802K_ezJcmQAtYCSE=

@@ -947,6 +947,21 @@ def _run_pose(
     else:
         social_merged = merge_social_votes([s for _, s in keyframe_social])
 
+    # Target de interacción estable a lo largo del video (no recalculado
+    # desde cero cada frame, ver pose_gait.TargetStability) -- se computa acá
+    # (una sola vez, reutilizado también en el render de abajo) para poder
+    # guardarlo en actions.json y no solo pintarlo en el video.
+    target_tracker = pose_gait.TargetStability()
+    target_by_frame: list[int | None] = []
+    for fi_t, dets_t in enumerate(all_frame_dets):
+        frame_social_t = social_for_video_frame(fi_t, keyframe_social)
+        target_by_frame.append(
+            target_tracker.update(
+                dets_t, {d["pid"]: frame_social_t.get(d["pid"]) for d in dets_t}
+            )
+        )
+    final_target = next((t for t in reversed(target_by_frame) if t is not None), None)
+
     (out / "actions.json").write_text(
         json.dumps(
             {
@@ -954,6 +969,7 @@ def _run_pose(
                 "detector": "pose+gait (pose_pipeline.py)",
                 "merged": {str(k): v for k, v in actions.items()},
                 "social_merged": {str(k): v for k, v in social_merged.items()},
+                "target": final_target,
                 "keyframes": [
                     {
                         "frame": kfi,
@@ -991,9 +1007,7 @@ def _run_pose(
         frame_social = social_for_video_frame(fi, keyframe_social)
         cur_chunk = fi // chunk_frames
         ann = frame.copy()
-        target_pid = pose_gait.pick_interaction_target(
-            dets, {d["pid"]: frame_social.get(d["pid"]) for d in dets}
-        )
+        target_pid = target_by_frame[fi]
         panel_entries: list[tuple[int, str, tuple[int, int, int], bool]] = []
         for d in dets:
             social_state = frame_social.get(d["pid"])

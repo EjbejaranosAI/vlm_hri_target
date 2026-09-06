@@ -14,6 +14,7 @@ reales (control negativo de gente de pie vs. caminata lateral confirmada).
 from __future__ import annotations
 
 import os
+import re
 
 import cv2
 import numpy as np
@@ -23,7 +24,13 @@ from ..config import YOLO_CONF, YOLO_IOU, YOLO_MAX_DET, YOLO_POST_NMS_IOU
 from ..detection import box_iou, nms_boxes, sort_dets_left_right
 from ..drawing import pid_label, ui_scale
 from ..motion import chunk_motion_by_pid, refine_chunk_labels
-from ..social_state import SOCIAL_ATTENTIVE, SOCIAL_AVAILABLE, SOCIAL_UNKNOWN
+from ..social_state import (
+    SOCIAL_ATTENTIVE,
+    SOCIAL_AVAILABLE,
+    SOCIAL_MOVING,
+    SOCIAL_UNKNOWN,
+    normalize_social_state,
+)
 from ..vlm.prompts import MOTION_COLOR_HINT, vlm_prompt
 
 # Tope de personas que se le mandan al VLM por trozo. Más gente = prompt más
@@ -410,6 +417,60 @@ def debias_group_walking(
     return out_a, out_s
 
 
+def require_moving_evidence(
+    actions: dict[int, str],
+    social: dict[int, str],
+    confirmed_moving: set[int],
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Modo rígido (default): CUALQUIER "walking"/"running" — venga del VLM
+    o de un forzado anterior — sin evidencia cinemática independiente
+    confirmada (`confirmed_moving`: marcha real + profundidad + histéresis
+    de varios trozos, o respaldo bbox-center) se quita, sin importar cuántas
+    personas haya en cuadro.
+
+    `debias_group_walking` solo corrige el sesgo cuando el GRUPO entero se
+    marca caminando a la vez (necesita 2+ personas y que la mayoría lo diga)
+    — deja sin cubrir el caso más común de falso positivo: una sola persona
+    en cuadro (sin "grupo" que debiasear) a la que el VLM le pega "walking"
+    de pura alucinación, o a la que la pose confirma solo por 2-3 trozos
+    seguidos (afinado, pero no infalible). Aquí se exige la misma evidencia
+    para cualquiera, esté solo o en grupo. Desactivable con
+    STRICT_MOVING_EVIDENCE=0 si en la práctica pierde demasiadas caminatas
+    reales (falsos negativos)."""
+    if os.environ.get("STRICT_MOVING_EVIDENCE", "1") != "1":
+        return actions, social
+    out_a = dict(actions)
+    out_s = dict(social)
+    for pid, act in actions.items():
+        if pid in confirmed_moving:
+            continue
+        norm = normalize_action(act)
+        tr = _action_traits(norm.lower())
+        if not (tr.get("walking") or tr.get("running")):
+            continue
+        out_a[pid] = _strip_walking_words(norm)
+        if normalize_social_state(str(out_s.get(pid, ""))) == SOCIAL_MOVING:
+            out_s[pid] = SOCIAL_UNKNOWN
+    return out_a, out_s
+
+
+_WALK_RUN_AND_RE = re.compile(r"\b(walking|running)\b\s+and\s+", re.IGNORECASE)
+_AND_WALK_RUN_RE = re.compile(r"\s+and\s+\b(walking|running)\b", re.IGNORECASE)
+_ONLY_WALK_RUN_RE = re.compile(r"^\s*(walking|running)\s*$", re.IGNORECASE)
+
+
+def _strip_walking_words(act: str) -> str:
+    """Quita 'walking'/'running' (con su 'and' adyacente) del texto, dejando
+    el resto de la actividad intacta -- p. ej. 'walking and watch camera' ->
+    'watch camera', no solo 'unknown'. Antes (require_moving_evidence) se
+    reconstruía desde _action_secondary_parts, que solo reconoce talking/
+    smiling/using phone y perdía cualquier otra actividad en texto libre."""
+    out = _WALK_RUN_AND_RE.sub("", act)
+    out = _AND_WALK_RUN_RE.sub("", out)
+    out = _ONLY_WALK_RUN_RE.sub("", out)
+    return out.strip() or "unknown"
+
+
 # Cuántos trozos (~1s cada uno) se mantiene "moviéndose" tras la última
 # evidencia real, para no perderlo en trozos donde la señal se ahoga en ruido
 # (p. ej. alguien lejos, caja chica) — sin esto, un par de trozos "ciegos"
@@ -696,6 +757,42 @@ def pick_interaction_target(
     return candidates[0][2]
 
 
+class TargetStability:
+    """Mantiene el mismo target de interacción entre frames en vez de
+    recalcularlo desde cero cada vez con pick_interaction_target.
+
+    Sin esto, dos personas casi empatadas (misma prioridad de estado, área de
+    caja parecida) pueden intercambiarse el "-Target-" de un frame a otro por
+    puro jitter de detección — el robot solo puede acercarse a UN target real
+    a la vez, no a uno que cambia constantemente. Se conserva el target
+    actual mientras siga siendo elegible (ATTENTIVE/AVAILABLE); solo se
+    recalcula cuando deja de serlo (sale de cuadro, pasa a ENGAGED/BUSY/
+    MOVING, etc.)."""
+
+    def __init__(self) -> None:
+        self._current: int | None = None
+
+    def update(self, dets: list[dict], social_states: dict[int, str]) -> int | None:
+        candidates = []
+        eligible: set[int] = set()
+        for d in dets:
+            pid = d["pid"]
+            state = social_states.get(pid)
+            if state not in _TARGET_PRIORITY:
+                continue
+            eligible.add(pid)
+            area = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"])
+            candidates.append((_TARGET_PRIORITY[state], -area, pid))
+        if self._current is not None and self._current in eligible:
+            return self._current
+        if not candidates:
+            self._current = None
+            return None
+        candidates.sort()
+        self._current = candidates[0][2]
+        return self._current
+
+
 def refine_labels_pose(
     actions: dict[int, str],
     social: dict[int, str],
@@ -730,6 +827,7 @@ def refine_labels_pose(
     )
     confirmed_moving = (moving_pids_hint or set()) | bbox_confirmed
     actions, social = debias_group_walking(actions, social, person_ids, confirmed_moving)
+    actions, social = require_moving_evidence(actions, social, confirmed_moving)
 
     if moving_pids_hint:
         for pid in moving_pids_hint:
@@ -764,20 +862,31 @@ def refine_labels_pose(
 def upgrade_attentive_by_gaze(
     social: dict[int, str], buffer_dets: list[list[dict]], person_ids: list[int]
 ) -> dict[int, str]:
-    """Corrige ATTENTIVE con la mirada real (marcha por pose, no el juicio
-    suelto del VLM sobre "orientado a cámara"):
-    - AVAILABLE → ATTENTIVE si SÍ mira de frente la mayoría del trozo.
-    - ATTENTIVE → AVAILABLE si el VLM la puso pero la pose confirma que NO
-      mira de frente (medido: el VLM a veces marca ATTENTIVE con la persona
-      mirando a otro lado, basta con estar de pie/quieta orientada hacia la
-      cámara en general).
-    No toca ENGAGED/BUSY/MOVING, que ya son más específicos que ATTENTIVE."""
+    """Corrige ATTENTIVE con la mirada real (pose), no el juicio suelto del
+    VLM sobre "orientado a cámara":
+    - AVAILABLE → ATTENTIVE si la pose SÍ confirma que mira de frente la
+      mayoría del trozo.
+    - ATTENTIVE → AVAILABLE si la pose NO lo confirma positivamente — ya sea
+      porque confirma que mira a otro lado, o porque no hay suficientes
+      datos de pose ese trozo para saberlo. Modo rígido (default): ATTENTIVE
+      exige evidencia POSITIVA de mirada, no basta con que el VLM lo diga y
+      nadie lo desmienta (medido: el VLM marca ATTENTIVE con la persona
+      mirando claramente a otro lado, y muchas veces la pose no tiene
+      suficiente confianza para "desmentirlo" con fuerza — sin exigir
+      confirmación positiva, ese ATTENTIVE quedaba sin corregir).
+    No toca ENGAGED/BUSY/MOVING, que ya son más específicos que ATTENTIVE.
+    Desactivable con STRICT_ATTENTIVE_GAZE=0 (vuelve a solo desmentir con
+    evidencia fuerte de NO mirar, dejando sin datos = sin tocar)."""
     facing = chunk_facing_camera_by_pid(buffer_dets, person_ids)
+    strict = os.environ.get("STRICT_ATTENTIVE_GAZE", "1") == "1"
     out = dict(social)
-    for pid, is_facing in facing.items():
+    for pid in person_ids:
         cur = out.get(pid)
-        if is_facing and cur == SOCIAL_AVAILABLE:
+        is_facing = facing.get(pid)
+        if is_facing is True and cur == SOCIAL_AVAILABLE:
             out[pid] = SOCIAL_ATTENTIVE
-        elif not is_facing and cur == SOCIAL_ATTENTIVE:
+        elif cur == SOCIAL_ATTENTIVE and (
+            is_facing is False or (strict and is_facing is None)
+        ):
             out[pid] = SOCIAL_AVAILABLE
     return out
