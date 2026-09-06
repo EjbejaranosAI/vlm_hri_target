@@ -226,16 +226,25 @@ def normalize_social_state(text: str) -> str:
     return SOCIAL_UNKNOWN
 
 
+def _never_unknown(state: str) -> str:
+    """El robot necesita una de las 5 categorías reales para decidir a quién
+    acercarse, no un "no sé": si ninguna señal permite clasificar a alguien,
+    se asume AVAILABLE -- el estado más neutro (no afirma que esté atento,
+    ocupado, en conversación ni en movimiento)."""
+    return state if state != SOCIAL_UNKNOWN else SOCIAL_AVAILABLE
+
+
 def resolve_social_states(
     actions: dict[int, str],
     parsed_social: dict[int, str] | None,
     person_ids: list[int] | None = None,
 ) -> dict[int, str]:
-    """vlm: usa parsed_social; map: deriva de acciones."""
+    """vlm: usa parsed_social; map: deriva de acciones. Nunca devuelve
+    SOCIAL_UNKNOWN (ver _never_unknown)."""
     pids = person_ids if person_ids is not None else list(actions.keys())
     if social_state_mode() == "map":
         base = social_states_from_actions(actions)
-        return {pid: base.get(pid, SOCIAL_UNKNOWN) for pid in pids}
+        return {pid: _never_unknown(base.get(pid, SOCIAL_UNKNOWN)) for pid in pids}
     parsed = parsed_social or {}
     out: dict[int, str] = {}
     for pid in pids:
@@ -245,7 +254,7 @@ def resolve_social_states(
             s = action_to_social_state(act)
         if social_reconcile_action():
             s = reconcile_social_with_action(act, s)
-        out[pid] = s
+        out[pid] = _never_unknown(s)
     return out
 
 

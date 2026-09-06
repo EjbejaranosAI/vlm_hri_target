@@ -27,6 +27,8 @@ output_*/
 # (varios de los que usamos en pruebas son stock footage con licencia)
 input_videos/*
 !input_videos/.gitkeep
+!input_videos/download_links.txt
+!input_videos/download_videos.sh
 
 # Sistema
 .DS_Store
