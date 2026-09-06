@@ -737,6 +737,16 @@ def refine_labels_pose(
                 continue
             act = normalize_action(actions[pid])
             tr = _action_traits(act.lower())
+            if tr.get("sitting") and not tr.get("standing"):
+                # Sentado y caminando son físicamente incompatibles. Si el VLM
+                # ya describió a esta persona como sentada, no se le fuerza
+                # "walking" encima aunque la cinemática (gait/profundidad) lo
+                # sugiera — es mucho más probable que sea ruido de esa señal
+                # (gesticular, inclinarse a comer/alcanzar algo) que alguien
+                # caminando sentado. Mismo criterio que ya usa
+                # vlm_hri.motion.apply_chunk_kinematic_hints (clearly_sitting)
+                # para el mismo caso en el pipeline sin pose — aquí faltaba.
+                continue
             if not tr.get("walking"):
                 extras = _action_secondary_parts(tr)
                 actions[pid] = " and ".join(["walking"] + extras) if extras else "walking"

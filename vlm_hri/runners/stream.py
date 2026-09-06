@@ -773,6 +773,34 @@ class RawFrame:
     dets: list[dict]
 
 
+def _scaled_raw_frame(rf: RawFrame, factor: float) -> RawFrame:
+    """Agranda el frame Y las coordenadas de detecciones/keypoints por
+    `factor` ANTES de dibujar encima -- para la ventana --display (DISPLAY_SCALE).
+
+    Escalar la imagen ya dibujada (texto/cajas/esqueleto) con cv2.resize se ve
+    borroso: la interpolación difumina los bordes nítidos del texto y las
+    líneas finas. Escalando el frame crudo primero y dibujando después, cada
+    elemento se dibuja nítido directamente al tamaño final (ui_scale ya
+    calcula el grosor/tamaño de fuente a partir de las dimensiones de la
+    imagen, así que sale proporcionalmente más grande, no borroso)."""
+    if factor == 1.0:
+        return rf
+    frame = cv2.resize(rf.frame_bgr, None, fx=factor, fy=factor, interpolation=cv2.INTER_LINEAR)
+    dets: list[dict] = []
+    for d in rf.dets:
+        nd = dict(d)
+        for k in ("x1", "y1", "x2", "y2"):
+            nd[k] = int(round(d[k] * factor))
+        kpts = d.get("kpts")
+        if kpts is not None:
+            kpts = kpts.copy()
+            kpts[:, 0] *= factor
+            kpts[:, 1] *= factor
+            nd["kpts"] = kpts
+        dets.append(nd)
+    return RawFrame(rf.frame_i, frame, dets)
+
+
 @dataclass
 class _PoseStreamOutput:
     writer: cv2.VideoWriter
@@ -1097,7 +1125,18 @@ def _run_pose(
         nonlocal chunk_raw, chunk_i, next_chunk_at
         if not chunk_raw:
             return
-        pids = sorted({d["pid"] for rf in chunk_raw for d in rf.dets})[: pose_gait.MAX_VLM_PEOPLE]
+        all_pids = sorted({d["pid"] for rf in chunk_raw for d in rf.dets})
+        # Igual que runners/video.py: prioriza a quien está más cerca de la
+        # cámara (mayor área de caja), no a quien tiene el pid numérico más
+        # bajo -- antes este truncado por orden de pid siempre se quedaba con
+        # los primeros IDs asignados en la sesión, sin importar qué tan
+        # relevantes (cercanos) fueran.
+        ranking_rows = [
+            {"person_id": d["pid"], "x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"]}
+            for rf in chunk_raw
+            for d in rf.dets
+        ]
+        pids = pose_gait.closest_n_pids(ranking_rows, all_pids, pose_gait.MAX_VLM_PEOPLE)
         _submit_chunk(
             vlm_queue,
             _PoseVlmChunkJob(
@@ -1140,16 +1179,14 @@ def _run_pose(
                     vlm_pending = state.vlm_pending
                     yolo_acum, vlm_acum, vlm_n = state.yolo_total_s, state.vlm_total_s, state.vlm_calls
                 try:
-                    preview_ann = _render_output_frame_pose(
-                        chunk_raw[-1], actions, social_states,
-                        w=w, h=h, fps=fps, chunk_sec=chunk_sec, chunk_index=chunk_i, chunk_count=chunk_i + 1,
+                    disp_rf = _scaled_raw_frame(chunk_raw[-1], DISPLAY_SCALE)
+                    disp_h, disp_w = disp_rf.frame_bgr.shape[:2]
+                    display_ann = _render_output_frame_pose(
+                        disp_rf, actions, social_states,
+                        w=disp_w, h=disp_h, fps=fps, chunk_sec=chunk_sec, chunk_index=chunk_i, chunk_count=chunk_i + 1,
                         yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
                         pipeline_total_s=time.perf_counter() - t_pipeline0, vlm_pending=vlm_pending,
                         draw_pose=draw_pose,
-                    )
-                    display_ann = cv2.resize(
-                        preview_ann, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE,
-                        interpolation=cv2.INTER_LINEAR,
                     )
                     cv2.imshow("stream-pose", display_ann)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
