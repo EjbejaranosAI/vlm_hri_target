@@ -35,14 +35,19 @@ lateral con el detalle de cada persona, y el candidato a target resaltado.
 ## Estructura del código
 
 ```
-main.py              # entrypoint (video / videos / stream)
+main.py              # entrypoint CLI (video / videos / stream)
 vlm_hri/              # paquete: detección, VLM, social-state, pose, runners
   config.py            # constantes de entorno
   detection.py          # YOLO + tracking
+  clustering.py          # agrupación por proximidad real (LiDAR, vía ROS2)
   vlm/                  # carga del modelo, prompts, parseo, inferencia
   pose/gait.py           # marcha por piernas + señales de pose
-  runners/              # video.py y stream.py (run(..., use_pose=True))
+  runners/              # video.py y stream.py (run(..., use_pose=True));
+                        # pose_session.py: sesión de streaming reutilizable
+                        # entre el CLI y el nodo ROS2
+  ros/                  # nodo ROS2 (ver sección "ROS2" más abajo)
 models/               # pesos de YOLO (se descargan solos, no versionados)
+package.xml, setup.py, launch/, config/  # paquete ROS2 (ament_python)
 ```
 
 ## Requisitos
@@ -98,6 +103,52 @@ Los resultados quedan en `output/<nombre_del_video_o_camera_N>/`:
 - `summary.json` — tiempos (YOLO, VLM, latencia media, factor de tiempo real).
 - `detections_per_frame.csv` — cajas crudas por frame (modo video, no streaming).
 
+## ROS2 (TIAGO / Gazebo)
+
+`vlm_hri_node` sustituye la cámara/detección/tracking propios por los de
+[`dynamic-tracking`](../dynamic-tracking) (LiDAR 360° + YOLO auxiliar, ya con
+tracking Kalman + ID estable + posición real en el mundo): se suscribe a la
+imagen cruda del robot y a `/detections/tracked`
+(`vision_msgs/Detection2DArray` — bbox, track_id embebido en `class_id` como
+`"person#7"`, y posición real vía `results[0].pose`), corre localmente solo
+el modelo de pose (para marcha/gait — dynamic_tracking no hace pose), y
+alimenta la misma sesión de streaming que usa `python main.py stream`.
+
+**Requiere un entorno con `numpy<2`.** `cv_bridge` (parte de ROS2) está
+compilado contra NumPy 1.x; el `.venv` de este repo usa NumPy 2.x para
+torch/ultralytics, y con eso `cv_bridge` falla al importar. Mismo problema
+(y misma solución) que ya documenta `dynamic-tracking/README.md`: usa un
+venv aparte con `numpy<2` para correr el nodo, o instala las dependencias de
+`requirements.txt` con `numpy<2` en un entorno dedicado a ROS2. El `.venv`
+normal (numpy 2.x) sigue sirviendo para `main.py` (CLI) sin tocar nada.
+
+```bash
+# en un venv/entorno con numpy<2 y acceso a los paquetes de ROS2 (rclpy,
+# cv_bridge, vision_msgs, message_filters, ament_index_python, launch)
+cd ~/ros_ws   # workspace con dynamic_tracking y este repo en src/
+colcon build --packages-select vlm_hri_target
+source install/setup.bash
+
+ros2 launch vlm_hri_target vlm_hri.launch.py profile:=sim   # Gazebo
+ros2 launch vlm_hri_target vlm_hri.launch.py profile:=robot # TIAGO real
+```
+
+Tópicos publicados (`config/vlm_hri_params_{sim,robot}.yaml` fija
+`frame_id: map` en sim / `odom` en robot, igual que `tracking_frame` en
+dynamic_tracking):
+
+| Tópico | Tipo | Contenido |
+|---|---|---|
+| `/vlm_hri/image_annotated` | `sensor_msgs/Image` | Mismo video anotado que el CLI (cajas, panel, banner) |
+| `/vlm_hri/social_states` | `std_msgs/String` (JSON) | `[{id, action, social_state, map_x, map_y, cluster_id, is_target}, ...]` |
+| `/vlm_hri/target_pose` | `geometry_msgs/PoseStamped` | Posición real del target elegido |
+
+`cluster_id` viene de agrupar personas por distancia real (LiDAR,
+`ENGAGED_PROXIMITY_MAX_M`, default 2.0m) — además de exponerse, se usa para
+corregir ENGAGED: si el VLM dice que dos personas están hablando pero su
+posición real las tiene a más de esa distancia (o nadie más está ENGAGED),
+se corrige a ATTENTIVE (`STRICT_ENGAGED_PROXIMITY=0` para desactivar).
+
 ## Configuración (variables de entorno)
 
 | Variable | Default | Qué hace |
@@ -106,6 +157,8 @@ Los resultados quedan en `output/<nombre_del_video_o_camera_N>/`:
 | `MAX_VLM_PEOPLE` | `10` | Máximo de personas por trozo que se le mandan al VLM (prioriza las más cercanas a la cámara). |
 | `VLM_PROFILE` | `balanced` | Resolución/tokens del VLM: `stream`\|`fast`\|`balanced`\|`quality`. |
 | `SOCIAL_STATE_MODE` | `vlm` | `vlm` = el VLM decide el estado social; `map` = se deriva solo de la acción. |
+| `STRICT_ENGAGED_PROXIMITY` | `1` | Solo ROS2: corrige ENGAGED sin corroboración de proximidad LiDAR a ATTENTIVE. |
+| `ENGAGED_PROXIMITY_MAX_M` | `2.0` | Distancia real (metros) máxima para considerar dos personas "en el mismo grupo". |
 | `HF_TOKEN` | — | Tu token de HuggingFace, si algún modelo lo requiere. |
 
 ## Rendimiento (medido)

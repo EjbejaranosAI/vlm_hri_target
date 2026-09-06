@@ -1,0 +1,20 @@
+# vlm_hri_node — Gazebo / simulación TIAGO.
+# Uso: ros2 launch vlm_hri_target vlm_hri.launch.py profile:=sim
+#
+# dynamic_tracking en sim publica las posiciones en el frame `map` (ver
+# dynamic-tracking/README.md, tabla "Simulation vs robot": tracking_frame:
+# map en sim). vlm_hri_node no hace ninguna transformación de frames --
+# solo reenvía la posición tal cual viene en /detections/tracked, así que
+# frame_id aquí debe coincidir con el tracking_frame real de dynamic_tracking.
+
+vlm_hri_node:
+  ros__parameters:
+    image_topic: "/head_front_camera/color/image_raw"
+    detections_topic: "/detections/tracked"
+    image_qos_reliability: "best_effort"
+    frame_id: "map"
+    chunk_sec: 1.0
+    assumed_fps: 30.0
+    use_pose: true
+    draw_pose: false
+    sync_slop_sec: 0.10

@@ -1,0 +1,20 @@
+# vlm_hri_node — TIAGO real.
+# Uso: ros2 launch vlm_hri_target vlm_hri.launch.py profile:=robot
+#
+# dynamic_tracking en robot real publica las posiciones en el frame `odom`
+# (ver dynamic-tracking/README.md, tabla "Simulation vs robot": tracking_frame:
+# odom en robot). Mismo comentario que el YAML de sim: frame_id debe
+# coincidir con el tracking_frame real de dynamic_tracking, vlm_hri_node no
+# transforma nada por su cuenta.
+
+vlm_hri_node:
+  ros__parameters:
+    image_topic: "/head_front_camera/color/image_raw"
+    detections_topic: "/detections/tracked"
+    image_qos_reliability: "best_effort"
+    frame_id: "odom"
+    chunk_sec: 1.0
+    assumed_fps: 30.0
+    use_pose: true
+    draw_pose: false
+    sync_slop_sec: 0.10
