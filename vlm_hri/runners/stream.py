@@ -838,7 +838,7 @@ def _render_output_frame_pose(
     target_pid = pose_gait.pick_interaction_target(
         rf.dets, {d["pid"]: social_states.get(d["pid"]) for d in rf.dets}
     )
-    panel_entries: list[tuple[int, str, tuple[int, int, int]]] = []
+    panel_entries: list[tuple[int, str, tuple[int, int, int], bool]] = []
     for d in rf.dets:
         social_state = social_states.get(d["pid"])
         color = social_box_color(social_state)
@@ -848,13 +848,13 @@ def _render_output_frame_pose(
         act = normalize_action(actions.get(d["pid"], ""))
         state_txt = social_state or "UNKNOWN"
         text = f"{state_txt} ({act})" if act and act != "unknown" else state_txt
-        if d["pid"] == target_pid:
-            text += " -Target-"
+        is_target = d["pid"] == target_pid
+        if is_target:
             cv2.rectangle(
                 ann, (d["x1"] - 3, d["y1"] - 3), (d["x2"] + 3, d["y2"] + 3),
                 (0, 255, 255), 2,
             )
-        panel_entries.append((d["pid"], text, color))
+        panel_entries.append((d["pid"], text, color, is_target))
     pose_gait.draw_side_panel(ann, panel_entries)
     draw_banner_video(
         ann,

@@ -34,13 +34,20 @@ _LABEL_BG_BGR = (48, 24, 56)
 _LABEL_FG_BGR = (255, 255, 255)
 
 
-_BANNER_BG_BGR = (32, 28, 40)
+_BANNER_BG_BGR = (38, 26, 22)
 
 
 _BANNER_ACCENT_BGR = (255, 90, 210)
 
 
 _BANNER_TEXT_BGR = (248, 248, 252)
+
+
+# Etiqueta ("YOLO", "VLM", ...) en un gris azulado apagado -- el valor
+# (el número que importa) va en _BANNER_TEXT_BGR (blanco casi puro), para que
+# el ojo distinga de un vistazo la etiqueta del dato sin depender de negrita
+# (las fuentes Hershey de OpenCV no tienen peso variable real).
+_BANNER_LABEL_BGR = (170, 158, 148)
 
 
 def pid_label(pid: int) -> str:
@@ -170,25 +177,30 @@ def draw_banner_video(
 ) -> None:
     """Barra de tiempos/latencia: una sola fila horizontal que ocupa todo el
     ancho del frame (arriba o abajo según UI_BANNER_SIDE), con los tiempos
-    clave repartidos de izquierda a derecha en vez de apilados verticalmente."""
+    clave repartidos de izquierda a derecha en vez de apilados verticalmente.
+
+    Cada segmento es (etiqueta, valor) -- la etiqueta se dibuja en un tono
+    apagado y el valor en blanco brillante, para que el ojo distinga el dato
+    de su descripción sin depender de negrita (los fonts Hershey de OpenCV no
+    tienen peso variable real)."""
     yolo_ms = 1000.0 * yolo_total_s / max(n_frames, 1)
     vlm_avg = vlm_total_s / max(vlm_calls, 1)
     other_s = max(0.0, pipeline_total_s - yolo_total_s - vlm_total_s)
     segments = [
-        f"Total {pipeline_total_s:.1f}s",
-        f"YOLO {yolo_total_s:.1f}s ({yolo_ms:.0f} ms/f)",
-        f"VLM {vlm_total_s:.2f}s (~{vlm_avg:.2f}s/inf, {vlm_calls})",
-        f"Otro {other_s:.1f}s",
+        ("Total", f"{pipeline_total_s:.1f}s"),
+        ("YOLO", f"{yolo_total_s:.1f}s ({yolo_ms:.0f} ms/f)"),
+        ("VLM", f"{vlm_total_s:.2f}s (~{vlm_avg:.2f}s/inf, {vlm_calls})"),
+        ("Otro", f"{other_s:.1f}s"),
     ]
     if vlm_input_kind == "chunks" and chunk_sec > 0:
         ci = (chunk_index or 0) + 1
         cc = chunk_count or vlm_calls
-        segments.append(f"Trozo {ci}/{cc} @ {chunk_sec:.0f}s")
+        segments.append(("Trozo", f"{ci}/{cc} @ {chunk_sec:.0f}s"))
     elif vlm_input_kind == "video":
-        segments.append(f"Clip @ {VIDEO_VLM_FPS} fps")
+        segments.append(("Clip", f"@ {VIDEO_VLM_FPS} fps"))
     else:
-        segments.append(f"Imagen f{frame_i or 0}")
-    segments.append(f"Personas {n_people}")
+        segments.append(("Imagen", f"f{frame_i or 0}"))
+    segments.append(("Personas", str(n_people)))
     side = os.environ.get("UI_BANNER_SIDE", "bottom").strip().lower()
     _draw_banner_row(img, segments, side=side if side in ("top", "bottom") else "bottom")
 
@@ -233,42 +245,75 @@ def _draw_banner_lines(
         cy = int(cy + baseline + gap)
 
 
-def _draw_banner_row(img, segments: list[str], *, side: str = "bottom") -> None:
+def _segment_width(font, fs: float, thick: int, label: str, value: str) -> int:
+    (lw, _), _ = cv2.getTextSize(f"{label} ", font, fs, thick)
+    (vw, _), _ = cv2.getTextSize(value, font, fs, thick)
+    return lw + vw
+
+
+def _draw_banner_row(
+    img, segments: list[tuple[str, str]], *, side: str = "bottom"
+) -> None:
     """Barra horizontal de ancho completo (menos un margen a cada lado) con
-    `segments` repartidos de izquierda a derecha en una sola fila — el primero
-    pegado al margen izquierdo, el último al derecho, separadores verticales
-    a mitad de cada hueco."""
+    `segments` (etiqueta, valor) repartidos de izquierda a derecha en una
+    sola fila — el primero pegado al margen izquierdo, el último al derecho,
+    separadores verticales a mitad de cada hueco.
+
+    Si el contenido no cabe a la escala normal (video muy angosto o muchos
+    segmentos), primero se encoge la fuente (hasta un piso legible) y, si aun
+    así no cabe, se sueltan los segmentos menos importantes (los últimos de
+    la lista) uno a uno — nunca se deja texto que se salga del frame."""
     h, w = img.shape[:2]
     s = ui_scale(h, w, banner=True)
     font = cv2.FONT_HERSHEY_DUPLEX
     fs = max(0.5, min(0.8, 0.48 * s))
+    fs_floor = 0.32
     thick = 1
     margin = int(max(8, 8 * s))
     inner_pad = int(max(10, 10 * s))
     pad_y = int(max(8, 8 * s))
+    min_gap = int(max(14, 14 * s))
 
-    widths = [cv2.getTextSize(seg, font, fs, thick)[0][0] for seg in segments]
+    x0, x1 = margin, max(margin + 1, w - margin)
+    inner_w = max(1, (x1 - x0) - 2 * inner_pad)
+
+    segs = list(segments)
+    while True:
+        widths = [_segment_width(font, fs, thick, lbl, val) for lbl, val in segs]
+        gaps = max(len(segs) - 1, 1)
+        needed = sum(widths) + min_gap * gaps
+        if needed <= inner_w or (fs <= fs_floor and len(segs) <= 1):
+            break
+        if fs > fs_floor:
+            # Escala proporcional al espacio que sobra/falta, no a tientas:
+            # una sola corrección basta salvo por el redondeo de cv2.
+            fs = max(fs_floor, fs * (inner_w / max(needed, 1)))
+        else:
+            segs = segs[:-1]  # sin espacio ni encogiendo más: suelta el último (menos crítico)
+
+    widths = [_segment_width(font, fs, thick, lbl, val) for lbl, val in segs]
     (_, text_h), baseline = cv2.getTextSize("Hg", font, fs, thick)
     bar_h = text_h + baseline + 2 * pad_y
 
-    x0, x1 = margin, max(margin + 1, w - margin)
     y0 = margin if side == "top" else max(margin, h - bar_h - margin)
     y1 = y0 + bar_h
     cv2.rectangle(img, (x0, y0), (x1, y1), _BANNER_BG_BGR, -1)
     border = max(2, int(round(s)))
     cv2.rectangle(img, (x0, y0), (x1, y1), _BANNER_ACCENT_BGR, border)
 
-    n = len(segments)
-    inner_w = max(1, (x1 - x0) - 2 * inner_pad)
-    min_gap = int(max(14, 14 * s))
+    n = len(segs)
     gaps = max(n - 1, 1)
     extra = inner_w - sum(widths)
     gap_w = max(min_gap, extra / gaps) if n > 1 else 0.0
 
     cy = int(y0 + pad_y + text_h)
     cx = float(x0 + inner_pad)
-    for i, (seg, tw) in enumerate(zip(segments, widths)):
-        cv2.putText(img, seg, (int(cx), cy), font, fs, _BANNER_TEXT_BGR, thick, cv2.LINE_8)
+    for i, ((label, value), tw) in enumerate(zip(segs, widths)):
+        (lw, _), _ = cv2.getTextSize(f"{label} ", font, fs, thick)
+        cv2.putText(img, label, (int(cx), cy), font, fs, _BANNER_LABEL_BGR, thick, cv2.LINE_8)
+        cv2.putText(
+            img, value, (int(cx) + lw, cy), font, fs, _BANNER_TEXT_BGR, thick, cv2.LINE_8
+        )
         cx += tw + gap_w
         if i < n - 1:
             sep_x = int(cx - gap_w / 2)

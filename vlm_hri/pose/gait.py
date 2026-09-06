@@ -21,7 +21,7 @@ import numpy as np
 from ..actions import _action_secondary_parts, _action_traits, normalize_action
 from ..config import YOLO_CONF, YOLO_IOU, YOLO_MAX_DET, YOLO_POST_NMS_IOU
 from ..detection import box_iou, nms_boxes, sort_dets_left_right
-from ..drawing import pid_label
+from ..drawing import pid_label, ui_scale
 from ..motion import chunk_motion_by_pid, refine_chunk_labels
 from ..social_state import SOCIAL_ATTENTIVE, SOCIAL_AVAILABLE, SOCIAL_UNKNOWN
 from ..vlm.prompts import MOTION_COLOR_HINT, vlm_prompt
@@ -527,37 +527,71 @@ def draw_box_only(img: np.ndarray, x1, y1, x2, y2, pid: int, color: tuple[int, i
     cv2.putText(img, label, (x1 + 3, ty - 1), font, fs, (255, 255, 255), 1, cv2.LINE_AA)
 
 
+_PANEL_BG_BGR = (26, 22, 20)
+_PANEL_BORDER_BGR = (90, 82, 76)
+_TARGET_BADGE_BGR = (0, 255, 255)  # amarillo -- mismo acento que el resalte de caja
+
+
 def draw_side_panel(
     img: np.ndarray,
-    entries: list[tuple[int, str, tuple[int, int, int]]],
+    entries: list[tuple[int, str, tuple[int, int, int], bool]],
     *,
     side: str = "right",
 ) -> None:
-    """Panel lateral con "ID{n}: {estado/acción}" por persona, uno por línea,
-    en vez de una etiqueta encima de cada caja (que ensucia la imagen)."""
+    """Panel lateral con una fila por persona ("ID{n}: {estado/acción}"), en
+    vez de una etiqueta encima de cada caja (que ensucia la imagen). Cada fila
+    lleva una barra de acento a la izquierda con el color de su estado (para
+    no depender solo del color del texto) y, si `is_target`, una insignia
+    "TARGET" aparte en vez de texto pegado a la descripción."""
     if not entries:
         return
     h_img, w_img = img.shape[:2]
+    s = ui_scale(h_img, w_img, banner=True)
     font = cv2.FONT_HERSHEY_SIMPLEX
-    fs = 0.5
+    fs = max(0.4, min(0.62, 0.55 * s))
     thick = 1
-    pad = 10
-    line_gap = 6
-    lines = [f"ID{pid}: {text}" for pid, text, _ in entries]
+    pad = int(max(8, 9 * s))
+    line_gap = int(max(5, 6 * s))
+    accent_w = int(max(3, 4 * s))
+    badge_gap = int(max(6, 7 * s))
+    badge_pad = int(max(3, 4 * s))
+
+    lines = [f"ID{pid}: {text}" for pid, text, _color, _t in entries]
     metrics = [cv2.getTextSize(ln, font, fs, thick) for ln in lines]
-    panel_w = max(tw for (tw, _th), _bl in metrics) + 2 * pad
+    badge_text = "TARGET"
+    (badge_w, badge_h), badge_bl = cv2.getTextSize(badge_text, font, fs * 0.8, thick)
+    badge_box_w = badge_w + 2 * badge_pad
+
+    row_w = [
+        tw + (badge_gap + badge_box_w if entry[3] else 0)
+        for ((tw, _th), _bl), entry in zip(metrics, entries)
+    ]
+    panel_w = accent_w + max(row_w) + 2 * pad
     panel_h = sum(th + bl + line_gap for (tw, th), bl in metrics) - line_gap + 2 * pad
-    margin = 10
+    margin = int(max(8, 10 * s))
     x0 = w_img - panel_w - margin if side == "right" else margin
     y0 = margin
     overlay = img.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
-    cv2.rectangle(img, (x0, y0), (x0 + panel_w, y0 + panel_h), (255, 255, 255), 1)
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), _PANEL_BG_BGR, -1)
+    cv2.addWeighted(overlay, 0.72, img, 0.28, 0, img)
+    cv2.rectangle(img, (x0, y0), (x0 + panel_w, y0 + panel_h), _PANEL_BORDER_BGR, 1)
+
     cy = y0 + pad
-    for line, ((tw, th), bl), (_pid, _text, color) in zip(lines, metrics, entries):
+    for line, ((tw, th), bl), (_pid, _text, color, is_target) in zip(lines, metrics, entries):
+        row_top, row_bot = cy - th, cy + bl
+        cv2.rectangle(img, (x0, row_top), (x0 + accent_w, row_bot), color, -1)
         cy += th
-        cv2.putText(img, line, (x0 + pad, cy), font, fs, color, thick, cv2.LINE_AA)
+        tx = x0 + accent_w + pad
+        cv2.putText(img, line, (tx, cy), font, fs, color, thick, cv2.LINE_AA)
+        if is_target:
+            bx0 = tx + tw + badge_gap
+            by1 = cy + badge_bl
+            by0 = by1 - badge_h - badge_bl - 2 * badge_pad
+            cv2.rectangle(img, (bx0, by0), (bx0 + badge_box_w, by1), _TARGET_BADGE_BGR, -1)
+            cv2.putText(
+                img, badge_text, (bx0 + badge_pad, by1 - badge_pad),
+                font, fs * 0.8, (20, 20, 20), thick, cv2.LINE_AA,
+            )
         cy += bl + line_gap
 
 
