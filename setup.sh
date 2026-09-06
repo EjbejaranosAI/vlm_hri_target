@@ -58,9 +58,9 @@ echo
 echo "== Listo =="
 echo "Activa el entorno con:  source $VENV_DIR/bin/activate"
 echo "Coloca tus videos de prueba en input_videos/ y corre:"
-echo "  python main_pose.py video -i input_videos/tu_video.mp4"
-echo "  python main_pose.py videos"
-echo "  python main_pose.py stream --camera 0 --display"
+echo "  python main.py video -i input_videos/tu_video.mp4"
+echo "  python main.py videos"
+echo "  python main.py stream --camera 0 --display"
 echo
 echo "Nota: los pesos de YOLO (yolo11n.pt, yolo26n-pose.pt) y del VLM"
 echo "(Qwen2-VL-2B-Instruct) se descargan solos la primera vez que corres algo."

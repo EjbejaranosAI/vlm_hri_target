@@ -32,6 +32,19 @@ robot pueda decidir **a quién acercarse** para iniciar una interacción.
 Todo el video/cámara final muestra: caja de color por estado + ID, un panel
 lateral con el detalle de cada persona, y el candidato a target resaltado.
 
+## Estructura del código
+
+```
+main.py              # entrypoint (video / videos / stream)
+vlm_hri/              # paquete: detección, VLM, social-state, pose, runners
+  config.py            # constantes de entorno
+  detection.py          # YOLO + tracking
+  vlm/                  # carga del modelo, prompts, parseo, inferencia
+  pose/gait.py           # marcha por piernas + señales de pose
+  runners/              # video.py y stream.py (run(..., use_pose=True))
+models/               # pesos de YOLO (se descargan solos, no versionados)
+```
+
 ## Requisitos
 
 - Linux, Python 3.10+
@@ -56,24 +69,27 @@ Coloca tus videos en `input_videos/` (no se versionan en git).
 
 **Un video:**
 ```bash
-python main_pose.py video -i input_videos/mi_video.mp4
+python main.py video -i input_videos/mi_video.mp4
 ```
 
 **Todos los videos de una carpeta:**
 ```bash
-python main_pose.py videos --input-dir input_videos
+python main.py videos --input-dir input_videos
 ```
 
 **Cámara en vivo:**
 ```bash
-python main_pose.py stream --camera 0 --display     # ventana en pantalla
-python main_pose.py stream --camera 0 --preview      # mpv/ffplay o navegador
+python main.py stream --camera 0 --display     # ventana en pantalla
+python main.py stream --camera 0 --preview      # mpv/ffplay o navegador
 ```
 
 **Video simulando cámara (para probar el modo streaming sin cámara física):**
 ```bash
-python main_pose.py stream -i input_videos/mi_video.mp4 --realtime --preview
+python main.py stream -i input_videos/mi_video.mp4 --realtime --preview
 ```
+
+Por defecto los tres modos usan el detector de pose (marcha por piernas).
+Con `--no-pose` corren solo con detección (yolo11n), sin esa señal.
 
 Los resultados quedan en `output/<nombre_del_video_o_camera_N>/`:
 - `annotated_actions.mp4` / `annotated_stream.mp4` — video final con las cajas, panel y target.
