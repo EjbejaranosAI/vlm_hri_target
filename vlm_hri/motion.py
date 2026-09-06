@@ -151,7 +151,7 @@ def apply_chunk_kinematic_hints(
     vez de descartarse, para no perder señales de posible interacción.
 
     `moving_pids`, si se pasa, reemplaza el cálculo de bbox-motion de aquí:
-    el pipeline de pose (run_video_pose.refine_labels_pose) ya resuelve
+    el pipeline de pose (vlm_hri.pose.gait.refine_labels_pose) ya resuelve
     "quién se mueve de verdad" combinando marcha real + profundidad + bbox +
     histéresis + debias de grupo ANTES de llamar a esta función — recalcular
     bbox-motion otra vez aquí (una señal más cruda, pensada para el pipeline
@@ -263,7 +263,7 @@ def enrich_action_posture(
     "eating" quedaba reducido a solo "standing", con la persona sentada
     comiendo reportada como si solo estuviera de pie).
 
-    `legs_visible` (pipeline de pose, ver pose_pipeline.chunk_legs_visible_by_pid):
+    `legs_visible` (pipeline de pose, ver vlm_hri.pose.gait.chunk_legs_visible_by_pid):
     si dice explícitamente False para un pid (piernas fuera de cuadro, p. ej.
     muy cerca de la cámara), NO se antepone ninguna postura adivinada — se
     confía en el texto del VLM tal cual, siguiendo la misma lógica que el

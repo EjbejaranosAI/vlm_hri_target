@@ -73,7 +73,7 @@ SKELETON = [
     (L_EAR, L_SHOULDER), (R_EAR, R_SHOULDER),
 ]
 
-# Calibrado con datos reales (ver pose_gait_test.py): control negativo
+# Calibrado con datos reales (control negativo
 # (gente de pie confirmada) vs. caminata lateral confirmada → 5°/2 cruces da
 # 74% de recall real con ~7% de falsos positivos (12°/2 daba solo 25% recall).
 MIN_AMPLITUDE_DEG = 5.0
@@ -85,7 +85,7 @@ THIN_LINE_PX = 1
 
 
 def detect_people_pose(yolo_pose, bgr: np.ndarray) -> list[dict]:
-    """Como pipeline.detect_people pero cada detección incluye "kpts" (17,3)."""
+    """Como detection.detect_people pero cada detección incluye "kpts" (17,3)."""
     res = yolo_pose.predict(
         bgr,
         classes=[0],
@@ -148,7 +148,7 @@ def _dets_from_result(res, bgr: np.ndarray, *, with_kpts: bool) -> list[dict]:
 
 
 def detect_people_batch(yolo, frames: list[np.ndarray]) -> list[list[dict]]:
-    """Como pipeline.detect_people pero para VARIOS frames en una sola llamada
+    """Como detection.detect_people pero para VARIOS frames en una sola llamada
     a predict() — medido: ~6ms/frame uno a uno vs ~2ms/frame en lotes de 8+
     (la GPU está infrautilizada con lotes de 1 en modelos tan chicos)."""
     if not frames:
@@ -179,7 +179,7 @@ POSE_MATCH_MIN_IOU = 0.3
 
 def attach_pose_keypoints(tracked_dets: list[dict], pose_dets: list[dict]) -> None:
     """Empareja por IoU cada detección de POSE con su caja ya trackeada (de
-    yolo11n, vía pipeline.detect_people + track_detections) y le añade "kpts".
+    yolo11n, vía detection.detect_people + track_detections) y le añade "kpts".
 
     Deliberadamente NO se usa la pose para detectar/trackear: la caja de
     yolo26n-pose es menos estable frame a frame (reparte capacidad entre
@@ -260,8 +260,8 @@ def chunk_gait_by_pid(
     """True si esa persona muestra tijera de piernas real (caminando) en el trozo.
 
     Caminar de verdad es una alternancia periódica del ángulo rodilla
-    izquierda vs. derecha; balancearse de pie no la tiene. Ver
-    pose_gait_test.py para la calibración empírica de los umbrales.
+    izquierda vs. derecha; balancearse de pie no la tiene. Umbrales
+    calibrados empíricamente (ver MIN_AMPLITUDE_DEG/MIN_CROSSINGS_PER_CHUNK).
     """
     out: dict[int, bool] = {}
     for pid in person_ids:
@@ -301,7 +301,7 @@ def chunk_legs_visible_by_pid(
     baja del cuerpo estuvo fuera de cuadro/ocluida la mayor parte del trozo
     (típico: persona muy cerca de la cámara, solo torso/cara en el frame) —
     en ese caso no debería aplicarse ningún heurístico de postura en absoluto
-    (ver enrich_action_posture en pipeline.py). Ausente del dict = sin datos
+    (ver vlm_hri.motion.enrich_action_posture). Ausente del dict = sin datos
     de pose ese trozo (el llamador cae al comportamiento anterior)."""
     out: dict[int, bool] = {}
     for pid in person_ids:
@@ -549,7 +549,7 @@ def chunk_facing_camera_by_pid(
     ausente (sin entrada) si no hay suficiente señal de pose para decidir en
     cualquier sentido — esa distinción importa porque una entrada False se usa
     para BAJAR un ATTENTIVE que el VLM puso por su cuenta (ver
-    run_video_pose.upgrade_attentive_by_gaze), y eso solo es seguro con
+    upgrade_attentive_by_gaze, en este mismo módulo), y eso solo es seguro con
     evidencia real de que NO mira, no con simple falta de datos."""
     out: dict[int, bool] = {}
     for pid in person_ids:
@@ -610,10 +610,10 @@ def refine_labels_pose(
 ) -> tuple[dict[int, str], dict[int, str]]:
     """Combina tres señales de movimiento en vez de una sola:
     1. El VLM ya vio la pose+color como pista y decidió con eso.
-    2. El respaldo determinístico por cinemática de caja de pipeline.py
+    2. El respaldo determinístico por cinemática de caja de vlm_hri.motion
        (bbox-center, recalibrado).
     3. `moving_pids_hint`: marcha por piernas + cambio de profundidad de la
-       caja + histéresis temporal (pose_pipeline.py), calculado en Fase 1.
+       caja + histéresis temporal (este módulo), calculado en Fase 1.
     Si CUALQUIERA de las tres dice "se mueve", se respeta — medido: dejar
     todo en manos de una sola señal (el VLM+pista) perdía el caso difícil de
     caminata de frente a cámara.
@@ -623,7 +623,7 @@ def refine_labels_pose(
     (medido: 4/5 personas "walking" con 3-36px de desplazamiento total en 60
     frames — nada). Si eso pasa, solo se respeta a quien SÍ tiene evidencia
     cinemática independiente."""
-    # El respaldo por cinemática de caja de pipeline.py mide posición ABSOLUTA
+    # El respaldo por cinemática de caja de vlm_hri.motion mide posición ABSOLUTA
     # en la imagen — si la cámara se mueve un poco (temblor, paneo), todas las
     # cajas se desplazan igual y parece que todo el mundo camina. Se le pasa
     # una copia con ese movimiento común (mediana entre personas) ya restado.
