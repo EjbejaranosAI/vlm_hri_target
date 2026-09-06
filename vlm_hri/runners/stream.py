@@ -784,6 +784,7 @@ class _PoseStreamOutput:
     chunk_sec: float
     t_pipeline0: float
     state: _PoseStreamState
+    draw_pose: bool = False
 
 
 @dataclass
@@ -828,9 +829,11 @@ def _render_output_frame_pose(
     vlm_calls: int,
     pipeline_total_s: float,
     vlm_pending: bool,
+    draw_pose: bool = False,
 ) -> np.ndarray:
     """Video final para el usuario (no el que ve el VLM): caja de color + ID +
-    panel lateral + resalte del target — igual estilo que run_video_pose.py."""
+    panel lateral + resalte del target — igual estilo que run_video_pose.py.
+    `draw_pose=True`: superpone además el esqueleto COCO-17 (visualización)."""
     ann = rf.frame_bgr.copy()
     target_pid = pose_gait.pick_interaction_target(
         rf.dets, {d["pid"]: social_states.get(d["pid"]) for d in rf.dets}
@@ -840,6 +843,8 @@ def _render_output_frame_pose(
         social_state = social_states.get(d["pid"])
         color = social_box_color(social_state)
         pose_gait.draw_box_only(ann, d["x1"], d["y1"], d["x2"], d["y2"], d["pid"], color)
+        if draw_pose:
+            pose_gait.draw_pose_skeleton(ann, d.get("kpts"))
         act = normalize_action(actions.get(d["pid"], ""))
         state_txt = social_state or "UNKNOWN"
         text = f"{state_txt} ({act})" if act and act != "unknown" else state_txt
@@ -892,6 +897,7 @@ def _flush_chunk_to_output_pose(job: _PoseVlmChunkJob, output: _PoseStreamOutput
                 chunk_index=job.chunk_index, chunk_count=chunk_count,
                 yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
                 pipeline_total_s=pipeline_now, vlm_pending=vlm_pending,
+                draw_pose=output.draw_pose,
             )
             output.writer.write(ann)
             if output.live_preview is not None:
@@ -1004,6 +1010,7 @@ def _run_pose(
     vlm=None,
     processor=None,
     device=None,
+    draw_pose: bool = False,
 ) -> Path:
     if (video_path is None) == (camera is None):
         raise SystemExit("Indica --input VIDEO o --camera N (no ambos).")
@@ -1072,6 +1079,7 @@ def _run_pose(
     stream_output = _PoseStreamOutput(
         writer=writer, lock=writer_lock, live_preview=None,
         w=w, h=h, fps=fps, chunk_sec=chunk_sec, t_pipeline0=t_pipeline0, state=state,
+        draw_pose=draw_pose,
     )
     vlm_queue: Queue = Queue(maxsize=8)
     worker = threading.Thread(
@@ -1137,6 +1145,7 @@ def _run_pose(
                         w=w, h=h, fps=fps, chunk_sec=chunk_sec, chunk_index=chunk_i, chunk_count=chunk_i + 1,
                         yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
                         pipeline_total_s=time.perf_counter() - t_pipeline0, vlm_pending=vlm_pending,
+                        draw_pose=draw_pose,
                     )
                     display_ann = cv2.resize(
                         preview_ann, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE,
@@ -1241,6 +1250,7 @@ def run(
     camera: int | None = None,
     output_dir: Path | None = None,
     use_pose: bool = True,
+    draw_pose: bool = False,
     display: bool = False,
     preview: bool = False,
     realtime: bool = False,
@@ -1253,12 +1263,15 @@ def run(
 ) -> Path:
     """Cámara o video en vivo. `use_pose=True` (default): detector de pose +
     marcha por piernas, ATTENTIVE por mirada y target de interacción
-    (yolo26n-pose). `use_pose=False`: solo detección (yolo11n)."""
+    (yolo26n-pose). `use_pose=False`: solo detección (yolo11n). `draw_pose`
+    (solo con use_pose): dibuja también el esqueleto COCO-17 en el video/
+    ventana final, no solo en lo que ve el VLM."""
     if use_pose:
         return _run_pose(
             video_path=video_path, camera=camera, output_dir=output_dir,
             display=display, preview=preview, realtime=realtime, max_frames=max_frames,
             yolo=yolo, yolo_pose=yolo_pose, vlm=vlm, processor=processor, device=device,
+            draw_pose=draw_pose,
         )
     return _run_plain(
         video_path=video_path, camera=camera, output_dir=output_dir,

@@ -168,29 +168,29 @@ def draw_banner_video(
     chunk_index: int | None = None,
     chunk_count: int | None = None,
 ) -> None:
-    """Banner inferior izquierdo: tiempos YOLO, VLM acumulado y total del pipeline."""
+    """Barra de tiempos/latencia: una sola fila horizontal que ocupa todo el
+    ancho del frame (arriba o abajo según UI_BANNER_SIDE), con los tiempos
+    clave repartidos de izquierda a derecha en vez de apilados verticalmente."""
     yolo_ms = 1000.0 * yolo_total_s / max(n_frames, 1)
     vlm_avg = vlm_total_s / max(vlm_calls, 1)
     other_s = max(0.0, pipeline_total_s - yolo_total_s - vlm_total_s)
-    lines = [
-        f"Total pipeline: {pipeline_total_s:.1f}s",
-        f"  YOLO {yolo_total_s:.1f}s | VLM {vlm_total_s:.2f}s | otro {other_s:.1f}s",
-        f"YOLO: {yolo_ms:.0f} ms/frame",
-        f"VLM acum: {vlm_total_s:.2f}s ({vlm_calls} inf, ~{vlm_avg:.2f}s/inf)",
+    segments = [
+        f"Total {pipeline_total_s:.1f}s",
+        f"YOLO {yolo_total_s:.1f}s ({yolo_ms:.0f} ms/f)",
+        f"VLM {vlm_total_s:.2f}s (~{vlm_avg:.2f}s/inf, {vlm_calls})",
+        f"Otro {other_s:.1f}s",
     ]
     if vlm_input_kind == "chunks" and chunk_sec > 0:
         ci = (chunk_index or 0) + 1
         cc = chunk_count or vlm_calls
-        lines.append(f"Trozo {ci}/{cc} cada {chunk_sec:.0f}s")
+        segments.append(f"Trozo {ci}/{cc} @ {chunk_sec:.0f}s")
     elif vlm_input_kind == "video":
-        lines.append(f"VLM: clip @ {VIDEO_VLM_FPS} fps")
+        segments.append(f"Clip @ {VIDEO_VLM_FPS} fps")
     else:
-        lines.append(f"VLM: imagen f{frame_i or 0}")
-    lines.append(f"Personas: {n_people}")
-    corner = os.environ.get("UI_BANNER_CORNER", "br").strip().lower()
-    if corner not in ("bl", "br", "tl", "tr"):
-        corner = "br"
-    _draw_banner_lines(img, lines, banner=True, corner=corner)
+        segments.append(f"Imagen f{frame_i or 0}")
+    segments.append(f"Personas {n_people}")
+    side = os.environ.get("UI_BANNER_SIDE", "bottom").strip().lower()
+    _draw_banner_row(img, segments, side=side if side in ("top", "bottom") else "bottom")
 
 
 def _draw_banner_lines(
@@ -231,3 +231,45 @@ def _draw_banner_lines(
             img, ln, (tx, cy), font, fs, _BANNER_TEXT_BGR, thick, cv2.LINE_8
         )
         cy = int(cy + baseline + gap)
+
+
+def _draw_banner_row(img, segments: list[str], *, side: str = "bottom") -> None:
+    """Barra horizontal de ancho completo (menos un margen a cada lado) con
+    `segments` repartidos de izquierda a derecha en una sola fila — el primero
+    pegado al margen izquierdo, el último al derecho, separadores verticales
+    a mitad de cada hueco."""
+    h, w = img.shape[:2]
+    s = ui_scale(h, w, banner=True)
+    font = cv2.FONT_HERSHEY_DUPLEX
+    fs = max(0.5, min(0.8, 0.48 * s))
+    thick = 1
+    margin = int(max(8, 8 * s))
+    inner_pad = int(max(10, 10 * s))
+    pad_y = int(max(8, 8 * s))
+
+    widths = [cv2.getTextSize(seg, font, fs, thick)[0][0] for seg in segments]
+    (_, text_h), baseline = cv2.getTextSize("Hg", font, fs, thick)
+    bar_h = text_h + baseline + 2 * pad_y
+
+    x0, x1 = margin, max(margin + 1, w - margin)
+    y0 = margin if side == "top" else max(margin, h - bar_h - margin)
+    y1 = y0 + bar_h
+    cv2.rectangle(img, (x0, y0), (x1, y1), _BANNER_BG_BGR, -1)
+    border = max(2, int(round(s)))
+    cv2.rectangle(img, (x0, y0), (x1, y1), _BANNER_ACCENT_BGR, border)
+
+    n = len(segments)
+    inner_w = max(1, (x1 - x0) - 2 * inner_pad)
+    min_gap = int(max(14, 14 * s))
+    gaps = max(n - 1, 1)
+    extra = inner_w - sum(widths)
+    gap_w = max(min_gap, extra / gaps) if n > 1 else 0.0
+
+    cy = int(y0 + pad_y + text_h)
+    cx = float(x0 + inner_pad)
+    for i, (seg, tw) in enumerate(zip(segments, widths)):
+        cv2.putText(img, seg, (int(cx), cy), font, fs, _BANNER_TEXT_BGR, thick, cv2.LINE_8)
+        cx += tw + gap_w
+        if i < n - 1:
+            sep_x = int(cx - gap_w / 2)
+            cv2.line(img, (sep_x, y0 + 3), (sep_x, y1 - 3), _BANNER_ACCENT_BGR, 1)

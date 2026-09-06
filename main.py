@@ -8,7 +8,8 @@
 
 Por defecto usa el detector de pose (yolo26n-pose.pt) con marcha por piernas
 como pista de color para el VLM. Pasa --no-pose para usar solo detección
-(yolo11n.pt), sin esa señal.
+(yolo11n.pt), sin esa señal. Pasa --draw-pose para además dibujar el
+esqueleto de pose en el video/ventana final (solo con pose activo).
 """
 
 from __future__ import annotations
@@ -30,11 +31,19 @@ def main() -> None:
     p_vid.add_argument("--input", "-i", type=Path, required=True)
     p_vid.add_argument("--output", type=Path, default=None)
     p_vid.add_argument("--no-pose", action="store_true", help="Solo detección (yolo11n), sin marcha por piernas")
+    p_vid.add_argument(
+        "--draw-pose", action="store_true",
+        help="Dibuja el esqueleto de pose también en el video final (solo con pose activo)",
+    )
 
     p_all = sub.add_parser("videos", help="Todos los .mp4 de una carpeta (offline)")
     p_all.add_argument("--input-dir", type=Path, default=ROOT / "input_videos")
     p_all.add_argument("--output", type=Path, default=None)
     p_all.add_argument("--no-pose", action="store_true", help="Solo detección (yolo11n), sin marcha por piernas")
+    p_all.add_argument(
+        "--draw-pose", action="store_true",
+        help="Dibuja el esqueleto de pose también en el video final (solo con pose activo)",
+    )
 
     p_stream = sub.add_parser(
         "stream",
@@ -55,17 +64,27 @@ def main() -> None:
     p_stream.add_argument("--realtime", action="store_true", help="Con --input: al fps del video")
     p_stream.add_argument("--max-frames", type=int, default=None, help="Limitar frames (pruebas)")
     p_stream.add_argument("--no-pose", action="store_true", help="Solo detección (yolo11n), sin marcha por piernas")
+    p_stream.add_argument(
+        "--draw-pose", action="store_true",
+        help="Dibuja el esqueleto de pose también en el video/ventana final (solo con pose activo)",
+    )
 
     args = parser.parse_args()
 
     if args.mode == "video":
         from vlm_hri.runners.video import run
 
-        run(video_path=args.input, output_dir=args.output, use_pose=not args.no_pose)
+        run(
+            video_path=args.input, output_dir=args.output,
+            use_pose=not args.no_pose, draw_pose=args.draw_pose,
+        )
     elif args.mode == "videos":
         from vlm_hri.runners.video import run_all
 
-        run_all(input_dir=args.input_dir, output_dir=args.output, use_pose=not args.no_pose)
+        run_all(
+            input_dir=args.input_dir, output_dir=args.output,
+            use_pose=not args.no_pose, draw_pose=args.draw_pose,
+        )
     else:
         from vlm_hri.runners.stream import run as run_stream
 
@@ -74,6 +93,7 @@ def main() -> None:
             camera=args.camera,
             output_dir=args.output,
             use_pose=not args.no_pose,
+            draw_pose=args.draw_pose,
             display=args.display,
             preview=args.preview,
             realtime=args.realtime,

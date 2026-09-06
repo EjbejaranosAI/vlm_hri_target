@@ -680,6 +680,7 @@ def _run_pose(
     vlm=None,
     processor=None,
     device=None,
+    draw_pose: bool = False,
 ) -> Path:
     video_path = Path(video_path)
     if not video_path.is_file():
@@ -998,6 +999,8 @@ def _run_pose(
             social_state = frame_social.get(d["pid"])
             color = social_box_color(social_state)
             pose_gait.draw_box_only(ann, d["x1"], d["y1"], d["x2"], d["y2"], d["pid"], color)
+            if draw_pose:
+                pose_gait.draw_pose_skeleton(ann, d.get("kpts"))
             act = normalize_action(frame_actions.get(d["pid"], ""))
             state_txt = social_state or "UNKNOWN"
             text = f"{state_txt} ({act})" if act and act != "unknown" else state_txt
@@ -1078,7 +1081,9 @@ def _run_pose(
     return out
 
 
-def _run_all_pose(input_dir: Path | None = None, output_dir: Path | None = None) -> list[Path]:
+def _run_all_pose(
+    input_dir: Path | None = None, output_dir: Path | None = None, *, draw_pose: bool = False
+) -> list[Path]:
     """Procesa todos los videos en input_videos/ con el pipeline de pose+gait."""
     indir = Path(input_dir or ROOT / "input_videos")
     base_out = Path(output_dir or _VIDEO_OUTPUT_DIR_POSE)
@@ -1107,6 +1112,7 @@ def _run_all_pose(input_dir: Path | None = None, output_dir: Path | None = None)
             out = _run_pose(
                 video_path=path, output_dir=base_out,
                 yolo=yolo, yolo_pose=yolo_pose, vlm=vlm, processor=processor, device=device,
+                draw_pose=draw_pose,
             )
         except SystemExit as e:
             print(f"  Omitido ({e})")
@@ -1124,6 +1130,7 @@ def run(
     output_dir: Path | None = None,
     *,
     use_pose: bool = True,
+    draw_pose: bool = False,
     yolo: YOLO | None = None,
     yolo_pose: YOLO | None = None,
     vlm=None,
@@ -1134,11 +1141,14 @@ def run(
     marcha por piernas (yolo26n-pose). `use_pose=False`: solo detección
     (yolo11n), sin señal de gait -- soporta además los modos de VLM
     alternativos (VIDEO_VLM_MODE=video|frame), que la variante de pose no
-    tiene."""
+    tiene. `draw_pose=True` (solo con use_pose): dibuja el esqueleto COCO-17
+    también en el video final (annotated_actions.mp4), no solo en el clip
+    interno que ve el VLM -- para visualizar/depurar la pose."""
     if use_pose:
         return _run_pose(
             video_path, output_dir,
             yolo=yolo, yolo_pose=yolo_pose, vlm=vlm, processor=processor, device=device,
+            draw_pose=draw_pose,
         )
     return _run_plain(
         video_path, output_dir,
@@ -1147,9 +1157,13 @@ def run(
 
 
 def run_all(
-    input_dir: Path | None = None, output_dir: Path | None = None, *, use_pose: bool = True
+    input_dir: Path | None = None,
+    output_dir: Path | None = None,
+    *,
+    use_pose: bool = True,
+    draw_pose: bool = False,
 ) -> list[Path]:
     """Procesa todos los videos de `input_dir` (default input_videos/)."""
     if use_pose:
-        return _run_all_pose(input_dir, output_dir)
+        return _run_all_pose(input_dir, output_dir, draw_pose=draw_pose)
     return _run_all_plain(input_dir, output_dir)

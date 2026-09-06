@@ -76,8 +76,16 @@ SKELETON = [
 # Calibrado con datos reales (control negativo
 # (gente de pie confirmada) vs. caminata lateral confirmada → 5°/2 cruces da
 # 74% de recall real con ~7% de falsos positivos (12°/2 daba solo 25% recall).
-MIN_AMPLITUDE_DEG = 5.0
-MIN_CROSSINGS_PER_CHUNK = 2
+# Configurables por si un video concreto necesita más rigor que el default
+# calibrado (subir cualquiera de los dos baja falsos positivos a costa de
+# recall — ver MotionHysteresis para el otro control de rigor: confirmación
+# por varios trozos antes de creer la evidencia cruda de este frame).
+MIN_AMPLITUDE_DEG = float(os.environ.get("GAIT_MIN_AMPLITUDE_DEG", "5.0"))
+MIN_CROSSINGS_PER_CHUNK = int(os.environ.get("GAIT_MIN_CROSSINGS", "2"))
+# Muestras válidas (ambas rodillas visibles) mínimas en el trozo para evaluar
+# la marcha — menos que esto es ruido, no una serie con la que medir
+# amplitud/cruces de forma confiable.
+MIN_GAIT_SAMPLES = int(os.environ.get("GAIT_MIN_SAMPLES", "4"))
 
 COLOR_MOVING_BGR = (255, 0, 0)  # azul
 COLOR_STANDING_BGR = (0, 0, 255)  # rojo
@@ -275,7 +283,7 @@ def chunk_gait_by_pid(
                 if l_ang is not None and r_ang is not None:
                     diffs.append(l_ang - r_ang)
                 break
-        if len(diffs) < 4:
+        if len(diffs) < MIN_GAIT_SAMPLES:
             continue
         arr = np.array(diffs)
         amplitude = float(arr.max() - arr.min())
@@ -330,7 +338,8 @@ def chunk_legs_visible_by_pid(
 # caja SÍ crece o encoge de forma sostenida. Si en la práctica da muchos
 # falsos positivos (p. ej. alguien agachándose), avisar para recalibrar igual
 # que se hizo con la marcha.
-DEPTH_MOTION_REL_CHANGE = 0.08
+DEPTH_MOTION_REL_CHANGE = float(os.environ.get("DEPTH_MOTION_REL_CHANGE", "0.08"))
+MIN_DEPTH_SAMPLES = int(os.environ.get("DEPTH_MOTION_MIN_SAMPLES", "6"))
 
 
 def chunk_depth_motion_by_pid(
@@ -346,7 +355,7 @@ def chunk_depth_motion_by_pid(
                 if d.get("pid") == pid:
                     heights.append(float(d["y2"] - d["y1"]))
                     break
-        if len(heights) < 6:
+        if len(heights) < MIN_DEPTH_SAMPLES:
             continue
         third = max(1, len(heights) // 3)
         h0 = float(np.mean(heights[:third]))
@@ -405,23 +414,53 @@ def debias_group_walking(
 # evidencia real, para no perderlo en trozos donde la señal se ahoga en ruido
 # (p. ej. alguien lejos, caja chica) — sin esto, un par de trozos "ciegos"
 # de por medio ya tumbaban el veredicto final por mayoría de votos.
-HYSTERESIS_CHUNKS = 3
+HYSTERESIS_CHUNKS = int(os.environ.get("HYSTERESIS_CHUNKS", "3"))
+
+# Rigor para ENCENDER "moviéndose" (evita pasarle al VLM un falso positivo de
+# un solo trozo ruidoso como pista de color): no basta con evidencia cruda
+# (gait o profundidad) en el trozo actual — se exige que aparezca en al menos
+# `min_confirm_chunks` de los últimos `confirm_window_chunks` trozos. Antes,
+# UN trozo con evidencia espuria (p. ej. un mal enganche de keypoints) no solo
+# marcaba ESE trozo como moviéndose: por la histéresis de apagado, se
+# propagaba `hold_chunks` trozos MÁS — un solo falso positivo se convertía en
+# varios segundos de pista azul incorrecta para el VLM.
+MIN_CONFIRM_CHUNKS = int(os.environ.get("GAIT_MIN_CONFIRM_CHUNKS", "2"))
+CONFIRM_WINDOW_CHUNKS = int(os.environ.get("GAIT_CONFIRM_WINDOW_CHUNKS", "3"))
 
 
 class MotionHysteresis:
-    """Estado de "moviéndose" por persona a lo largo del video: se enciende
-    con evidencia real (marcha o cambio de profundidad) y se mantiene unos
-    trozos después, apagándose solo tras varios trozos seguidos sin ninguna."""
+    """Estado de "moviéndose" por persona a lo largo del video.
 
-    def __init__(self, hold_chunks: int = HYSTERESIS_CHUNKS) -> None:
+    Se ENCIENDE solo tras confirmar evidencia real (marcha o cambio de
+    profundidad) en `min_confirm_chunks` de los últimos `confirm_window_chunks`
+    trozos — no con un solo trozo ruidoso — y una vez encendida se mantiene
+    (histéresis) `hold_chunks` trozos tras la última evidencia, para no
+    parpadear en trozos donde la señal se ahoga en ruido."""
+
+    def __init__(
+        self,
+        hold_chunks: int = HYSTERESIS_CHUNKS,
+        min_confirm_chunks: int = MIN_CONFIRM_CHUNKS,
+        confirm_window_chunks: int = CONFIRM_WINDOW_CHUNKS,
+    ) -> None:
         self.hold_chunks = hold_chunks
+        self.min_confirm_chunks = min_confirm_chunks
+        self.confirm_window_chunks = max(confirm_window_chunks, min_confirm_chunks)
+        self._raw_history: dict[int, list[int]] = {}
         self._last_moving_ci: dict[int, int] = {}
 
     def update(self, ci: int, raw_moving_pids: set[int], present_pids: set[int]) -> set[int]:
-        for pid in raw_moving_pids:
-            self._last_moving_ci[pid] = ci
+        for pid in present_pids:
+            hist = self._raw_history.setdefault(pid, [])
+            if pid in raw_moving_pids:
+                hist.append(ci)
+            self._raw_history[pid] = [
+                c for c in hist if ci - c < self.confirm_window_chunks
+            ]
         out: set[int] = set()
         for pid in present_pids:
+            if len(self._raw_history.get(pid, [])) >= self.min_confirm_chunks:
+                self._last_moving_ci[pid] = ci
             last = self._last_moving_ci.get(pid)
             if last is not None and ci - last <= self.hold_chunks:
                 out.add(pid)
@@ -449,6 +488,30 @@ def draw_thin_pose_box(
     ty = max(th + 2, y1 - 2)
     cv2.rectangle(img, (x1, ty - th - 2), (x1 + tw + 4, ty + baseline), (0, 0, 0), -1)
     cv2.putText(img, label, (x1 + 2, ty - 1), font, fs, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+POSE_SKELETON_BGR = (0, 215, 255)  # amarillo/naranja: no se confunde con los
+# colores de estado social (verde/cian/naranja/rojo/azul) ni con el azul/rojo
+# de moving/standing de draw_thin_pose_box (ese es para el clip del VLM).
+
+
+def draw_pose_skeleton(img: np.ndarray, kpts: np.ndarray | None) -> None:
+    """Esqueleto COCO-17 en color fijo, para visualizar la pose en el video
+    final que ve el usuario — independiente del color azul/rojo de
+    draw_thin_pose_box (ese codifica movimiento y es solo para el clip que ve
+    el VLM). Pensado para depurar/inspeccionar la pose, no para decidir nada."""
+    if kpts is None:
+        return
+    for a, b in SKELETON:
+        pa, pb = kpts[a], kpts[b]
+        if pa[2] >= KPT_CONF_MIN and pb[2] >= KPT_CONF_MIN:
+            cv2.line(
+                img, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])),
+                POSE_SKELETON_BGR, THIN_LINE_PX,
+            )
+    for x, y, c in kpts:
+        if c >= KPT_CONF_MIN:
+            cv2.circle(img, (int(x), int(y)), 2, POSE_SKELETON_BGR, -1)
 
 
 def draw_box_only(img: np.ndarray, x1, y1, x2, y2, pid: int, color: tuple[int, int, int]) -> None:
