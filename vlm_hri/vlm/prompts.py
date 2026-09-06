@@ -1,4 +1,13 @@
-"""Prompts del VLM: plantillas (JSON en prompt_templates/) + construcción según modo/social."""
+"""Prompts del VLM: plantillas (JSON en prompt_templates/) + construcción según modo/social.
+
+Dos categorías, una por archivo — cada una con las variantes con/sin estado
+social (y, en "full", la nota anti-sesgo de video) bajo una clave de máximo
+dos palabras (``with_social``, ``no_social``, ``motion_hint``):
+
+- ``COMPACT``: mínimo consumo de tokens, para uso normal (recomendado).
+- ``FULL``: instrucciones largas y estructuradas por jerarquía (más tokens,
+  úsese solo si el modo compacto da resultados pobres para el caso de uso).
+"""
 
 from __future__ import annotations
 
@@ -13,22 +22,26 @@ from ..social_state import use_vlm_social_states
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompt_templates"
 
 
-def _load(name: str) -> str:
+def _load_category(name: str) -> dict[str, str]:
+    """{clave (<=2 palabras): texto de plantilla} de prompt_templates/{name}.json."""
     with open(_PROMPTS_DIR / f"{name}.json", encoding="utf-8") as f:
-        return json.load(f)["template"]
+        raw = json.load(f)
+    return {key: entry["template"] for key, entry in raw.items()}
 
 
-# —— Modo compacto (mínimo consumo de tokens + alta precisión) ——————————
-COMPACT_WITH_SOCIAL = _load("compact_with_social")
-COMPACT_NO_SOCIAL = _load("compact_no_social")
+COMPACT = _load_category("compact")
+FULL = _load_category("full")
 
-# —— Modo completo (instrucciones estructuradas por jerarquía) ——————————
-FULL_WITH_SOCIAL = _load("full_with_social")
-FULL_NO_SOCIAL = _load("full_no_social")
-
-NO_PEOPLE = _load("no_people")
-MOTION_HINT_VIDEO = _load("motion_hint_video")
-MOTION_COLOR_HINT = _load("motion_color_hint")
+# Snippets pequeños de propósito general (no son "el prompt" en sí, sino
+# texto que se antepone/pospone al elegido arriba) — no dependen de
+# compact/full, viven como constantes simples en vez de una plantilla más.
+NO_PEOPLE = "{}"
+MOTION_COLOR_HINT = (
+    "Sensor hint: BLUE box = walking detected; RED box = stationary. This hint can be "
+    "noisy (e.g. a person just appearing/re-detected can flash BLUE without moving) — "
+    "use it as a prior, but only label someone as walking/MOVING if you also see them "
+    "actually changing position across the clip.\n"
+)
 
 
 def _vlm_prompt_compact(dets: list[dict], *, video: bool) -> str:
@@ -50,11 +63,11 @@ def _vlm_prompt_compact(dets: list[dict], *, video: bool) -> str:
         )
         if len(pids) > 2:
             example += ",..."
-        return COMPACT_WITH_SOCIAL.format(
+        return COMPACT["with_social"].format(
             clip=clip, id_map=id_map, example=example, keys=keys
         )
     example = ",".join(f'"{p}":"<action>"' for p in pids[:2])
-    return COMPACT_NO_SOCIAL.format(clip=clip, id_map=id_map, example=example, keys=keys)
+    return COMPACT["no_social"].format(clip=clip, id_map=id_map, example=example, keys=keys)
 
 
 def _vlm_prompt_full(dets: list[dict], *, video: bool) -> str:
@@ -64,13 +77,13 @@ def _vlm_prompt_full(dets: list[dict], *, video: bool) -> str:
         for d in dets
     )
     ctx = "this short video clip" if video else "this image"
-    motion_hint = MOTION_HINT_VIDEO if video else ""
+    motion_hint = FULL["motion_hint"] if video else ""
     keys = ", ".join(str(p) for p in pids)
     if use_vlm_social_states():
         slots = ",".join(
             f'"{p}":{{"action":"<what they do>","social":"<STATE>"}}' for p in pids
         )
-        return FULL_WITH_SOCIAL.format(
+        return FULL["with_social"].format(
             ctx=ctx,
             n_people=len(pids),
             motion_hint=motion_hint,
@@ -79,7 +92,7 @@ def _vlm_prompt_full(dets: list[dict], *, video: bool) -> str:
             keys=keys,
         )
     slots = ",".join(f'"{p}":"<action>"' for p in pids)
-    return FULL_NO_SOCIAL.format(
+    return FULL["no_social"].format(
         ctx=ctx,
         n_people=len(pids),
         motion_hint=motion_hint,

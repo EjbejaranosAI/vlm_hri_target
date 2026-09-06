@@ -1,4 +1,0 @@
-{
-  "description": "Modo completo SIN estado social — solo descripción de acción. Usa {ctx}/{n_people}/{motion_hint}/{mapping}/{keys}/{slots}.",
-  "template": "Context: {ctx} ({n_people} people with purple ID<number> boxes).\n{motion_hint}Mapping:\n{mapping}\n\nDescribe action for keys [{keys}] in 1-3 words.\nOutput ONLY raw JSON format: {{{slots}}}."
-}

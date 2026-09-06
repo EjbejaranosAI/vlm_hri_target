@@ -1,4 +1,0 @@
-{
-  "description": "Usado por pose_pipeline.py: explica el color de la caja como pista de un sensor de movimiento INDEPENDIENTE del VLM (marcha real de piernas, no el juicio visual del VLM sobre esa caja).",
-  "template": "Sensor hint: BLUE box = walking detected; RED box = stationary. This hint can be noisy (e.g. a person just appearing/re-detected can flash BLUE without moving) — use it as a prior, but only label someone as walking/MOVING if you also see them actually changing position across the clip.\n"
-}
