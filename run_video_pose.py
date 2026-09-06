@@ -71,20 +71,36 @@ def refine_labels_pose(
             if not tr.get("walking"):
                 extras = P._action_secondary_parts(tr)
                 actions[pid] = " and ".join(["walking"] + extras) if extras else "walking"
-    return P.refine_chunk_labels(actions, social, compensated, person_ids, frame_size)
+
+    # Piernas visibles: si NO lo están (persona muy cerca de la cámara, solo
+    # torso/cara en el frame), refine_chunk_labels no debe adivinar postura —
+    # se confía en lo que el VLM describió (ver enrich_action_posture).
+    legs_visible = PP.chunk_legs_visible_by_pid(compensated, person_ids)
+    return P.refine_chunk_labels(
+        actions, social, compensated, person_ids, frame_size,
+        moving_pids=confirmed_moving, legs_visible=legs_visible,
+    )
 
 
 def upgrade_attentive_by_gaze(
     social: dict[int, str], buffer_dets: list[list[dict]], person_ids: list[int]
 ) -> dict[int, str]:
-    """AVAILABLE → ATTENTIVE si la persona mira de frente a la cámara la
-    mayoría del trozo (no toca ENGAGED/BUSY/MOVING, que ya son más específicos
-    que ATTENTIVE)."""
+    """Corrige ATTENTIVE con la mirada real (marcha por pose, no el juicio
+    suelto del VLM sobre "orientado a cámara"):
+    - AVAILABLE → ATTENTIVE si SÍ mira de frente la mayoría del trozo.
+    - ATTENTIVE → AVAILABLE si el VLM la puso pero la pose confirma que NO
+      mira de frente (medido: el VLM a veces marca ATTENTIVE con la persona
+      mirando a otro lado, basta con estar de pie/quieta orientada hacia la
+      cámara en general).
+    No toca ENGAGED/BUSY/MOVING, que ya son más específicos que ATTENTIVE."""
     facing = PP.chunk_facing_camera_by_pid(buffer_dets, person_ids)
     out = dict(social)
     for pid, is_facing in facing.items():
-        if is_facing and out.get(pid) == P.SOCIAL_AVAILABLE:
+        cur = out.get(pid)
+        if is_facing and cur == P.SOCIAL_AVAILABLE:
             out[pid] = P.SOCIAL_ATTENTIVE
+        elif not is_facing and cur == P.SOCIAL_ATTENTIVE:
+            out[pid] = P.SOCIAL_AVAILABLE
     return out
 
 

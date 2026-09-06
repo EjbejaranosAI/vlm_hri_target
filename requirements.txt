@@ -5,6 +5,7 @@ transformers>=4.45.0
 accelerate
 bitsandbytes
 qwen-vl-utils
+torchcodec
 pillow
 opencv-python-headless
 numpy

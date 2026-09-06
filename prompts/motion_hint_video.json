@@ -1,0 +1,4 @@
+{
+  "description": "Nota anti-sesgo para clips de video: no juzgar 'walking' desde un solo frame estático.",
+  "template": "Note: Track gait across clip. Do not label walking as standing from a single static frame.\n"
+}

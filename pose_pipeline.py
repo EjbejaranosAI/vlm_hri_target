@@ -283,6 +283,43 @@ def chunk_gait_by_pid(
     return out
 
 
+# EXPERIMENTAL — sin calibrar con datos reales (a diferencia de
+# MIN_AMPLITUDE_DEG/MIN_CROSSINGS_PER_CHUNK). Deliberadamente laxo: basta con
+# un par de frames buenos en el trozo para contar como "piernas visibles".
+LEGS_VISIBLE_RATIO = 0.3
+
+
+def chunk_legs_visible_by_pid(
+    buffer_dets: list[list[dict]], person_ids: list[int]
+) -> dict[int, bool]:
+    """True si se vieron cadera/rodilla/tobillo (cualquier pierna) con
+    confianza usable en suficientes frames del trozo como para confiar en
+    CUALQUIER juicio de sentado/de pie sobre esa persona; False si la parte
+    baja del cuerpo estuvo fuera de cuadro/ocluida la mayor parte del trozo
+    (típico: persona muy cerca de la cámara, solo torso/cara en el frame) —
+    en ese caso no debería aplicarse ningún heurístico de postura en absoluto
+    (ver enrich_action_posture en pipeline.py). Ausente del dict = sin datos
+    de pose ese trozo (el llamador cae al comportamiento anterior)."""
+    out: dict[int, bool] = {}
+    for pid in person_ids:
+        seen = 0
+        legs_ok = 0
+        for row in buffer_dets:
+            for d in row:
+                if d.get("pid") != pid or "kpts" not in d:
+                    continue
+                seen += 1
+                l_ok = _knee_angle(d["kpts"], L_HIP, L_KNEE, L_ANKLE) is not None
+                r_ok = _knee_angle(d["kpts"], R_HIP, R_KNEE, R_ANKLE) is not None
+                if l_ok or r_ok:
+                    legs_ok += 1
+                break
+        if seen == 0:
+            continue
+        out[pid] = (legs_ok / seen) >= LEGS_VISIBLE_RATIO
+    return out
+
+
 # EXPERIMENTAL — sin calibrar con datos reales todavía (a diferencia de
 # MIN_AMPLITUDE_DEG/MIN_CROSSINGS_PER_CHUNK, que sí se midieron). Complementa
 # la tijera de piernas: alguien caminando derecho hacia/desde la cámara apenas
@@ -335,9 +372,14 @@ def debias_group_walking(
     solo se respeta a quien tiene evidencia cinemática INDEPENDIENTE de
     movimiento real (`confirmed_moving`: marcha, profundidad o bbox-center,
     NO el propio juicio del VLM) — al resto se le quita el "walking" y se
-    deja que el resto del pipeline le asigne su postura real."""
+    deja que el resto del pipeline le asigne su postura real.
+
+    También aplica con solo 2 personas: "los dos caminando a la vez" sin
+    evidencia independiente es el mismo sesgo, solo que con grupo más chico
+    (medido: sesión con 2 personas sentadas —solo torso visible— marcadas
+    "walking"/MOVING varios trozos seguidos sin ninguna evidencia cinemática)."""
     n = len(person_ids)
-    if n < 3:
+    if n < 2:
         return actions, social
 
     def is_walking(pid: int) -> bool:
@@ -491,11 +533,21 @@ def is_facing_camera(kpts: np.ndarray) -> bool:
     return bool(nose[2] >= FACE_CONF_MIN and l_eye[2] >= FACE_CONF_MIN and r_eye[2] >= FACE_CONF_MIN)
 
 
+FACING_MIN_SEEN = 4
+FACING_TRUE_RATIO = 0.5
+FACING_FALSE_RATIO = 0.2
+
+
 def chunk_facing_camera_by_pid(
     buffer_dets: list[list[dict]], person_ids: list[int]
 ) -> dict[int, bool]:
     """True si la persona mira de frente a la cámara en la MAYORÍA de los
-    frames del trozo (no solo un frame suelto, para evitar parpadeos)."""
+    frames del trozo; False si claramente NO mira de frente en casi ninguno;
+    ausente (sin entrada) si no hay suficiente señal de pose para decidir en
+    cualquier sentido — esa distinción importa porque una entrada False se usa
+    para BAJAR un ATTENTIVE que el VLM puso por su cuenta (ver
+    run_video_pose.upgrade_attentive_by_gaze), y eso solo es seguro con
+    evidencia real de que NO mira, no con simple falta de datos."""
     out: dict[int, bool] = {}
     for pid in person_ids:
         seen = 0
@@ -507,8 +559,13 @@ def chunk_facing_camera_by_pid(
                     if is_facing_camera(d["kpts"]):
                         facing += 1
                     break
-        if seen >= 4 and facing / seen >= 0.5:
+        if seen < FACING_MIN_SEEN:
+            continue
+        ratio = facing / seen
+        if ratio >= FACING_TRUE_RATIO:
             out[pid] = True
+        elif ratio <= FACING_FALSE_RATIO:
+            out[pid] = False
     return out
 
 

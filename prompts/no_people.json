@@ -1,0 +1,4 @@
+{
+  "description": "Respuesta fija cuando no hay personas detectadas en el frame.",
+  "template": "{}"
+}

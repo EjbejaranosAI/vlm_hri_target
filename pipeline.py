@@ -458,7 +458,8 @@ def _is_sitting_phrase(low: str) -> bool:
     return bool(
         re.search(r"\bsitting\b", low)
         or re.search(r"\bseated\b", low)
-        or re.search(r"\bsit\s+on\b", low)
+        or re.search(r"\bsit\b", low)
+        or re.search(r"\bsits\b", low)
         or re.search(r"\bon\s+(?:a\s+)?(?:chair|bench|sofa|couch|seat)\b", low)
     )
 
@@ -633,6 +634,8 @@ def apply_chunk_kinematic_hints(
     buffer_dets: list[list[dict]],
     person_ids: list[int],
     frame_size: tuple[int, int],
+    *,
+    moving_pids: set[int] | None = None,
 ) -> dict[int, str]:
     """Combina VLM + movimiento de cajas en el trozo (walking/sitting).
 
@@ -640,10 +643,23 @@ def apply_chunk_kinematic_hints(
     camina — prima sobre lo que haya dicho el VLM (p. ej. "talking"), salvo
     que el VLM afirme sentado (incompatible con caminar). Cualquier intención
     secundaria detectada (hablar, sonreír, teléfono) se conserva anexada en
-    vez de descartarse, para no perder señales de posible interacción."""
-    if not chunk_motion_enabled() or not buffer_dets:
+    vez de descartarse, para no perder señales de posible interacción.
+
+    `moving_pids`, si se pasa, reemplaza el cálculo de bbox-motion de aquí:
+    el pipeline de pose (run_video_pose.refine_labels_pose) ya resuelve
+    "quién se mueve de verdad" combinando marcha real + profundidad + bbox +
+    histéresis + debias de grupo ANTES de llamar a esta función — recalcular
+    bbox-motion otra vez aquí (una señal más cruda, pensada para el pipeline
+    SIN pose que no tiene nada mejor) podía pisar esa decisión ya tomada. Sin
+    `moving_pids` (pipeline sin pose), el comportamiento es el de siempre."""
+    if not buffer_dets:
         return actions
-    motion = chunk_motion_by_pid(buffer_dets, person_ids, frame_size)
+    if moving_pids is not None:
+        motion = {pid: "walking" for pid in moving_pids}
+    elif chunk_motion_enabled():
+        motion = chunk_motion_by_pid(buffer_dets, person_ids, frame_size)
+    else:
+        return actions
     posture = chunk_posture_hints(buffer_dets, person_ids, motion)
     out: dict[int, str] = {}
     for pid in person_ids:
@@ -654,7 +670,17 @@ def apply_chunk_kinematic_hints(
         has_semantic = tr["talking"] or tr["smiling"] or tr["phone"]
         clearly_sitting = tr["sitting"] and not tr["standing"]
         if motion.get(pid) == "walking" and not clearly_sitting:
-            out[pid] = " and ".join(["walking"] + extras) if extras else "walking"
+            # Antes esto solo conservaba talking/smiling/phone (extras) y
+            # descartaba cualquier otra descripción del VLM (p. ej.
+            # "greeting person", "gesturing") — con el prompt ahora en texto
+            # libre, eso perdía la interacción real y forzaba MOVING sobre
+            # cualquier cosa. Se conserva el texto tal cual (solo se
+            # reemplaza la postura de pie por "walking", que ya la implica).
+            if act.lower() in ("unknown", "standing", "stand", "sitting", "sit", "", "walking", "walk"):
+                out[pid] = "walking"
+            else:
+                stripped = re.sub(r"^(standing|stand)\s+and\s+", "", act, flags=re.IGNORECASE)
+                out[pid] = f"walking and {stripped}"
             continue
         if (
             posture.get(pid) == "sitting"
@@ -669,30 +695,6 @@ def apply_chunk_kinematic_hints(
     for pid, act in actions.items():
         if pid not in out:
             out[pid] = normalize_action(act)
-    return out
-
-
-def fill_unknown_actions_from_buffer(
-    actions: dict[int, str],
-    buffer_dets: list[list[dict]],
-    person_ids: list[int],
-) -> dict[int, str]:
-    """Si el VLM devolvió unknown pero la persona está en el trozo → standing (postura neutra)."""
-    out = dict(actions)
-    for pid in person_ids:
-        act = normalize_action(out.get(pid, "unknown"))
-        if act != "unknown":
-            continue
-        seen = False
-        for row in buffer_dets:
-            for d in row:
-                if d["pid"] == pid:
-                    seen = True
-                    break
-            if seen:
-                break
-        if seen:
-            out[pid] = "standing"
     return out
 
 
@@ -742,8 +744,27 @@ def enrich_action_posture(
     actions: dict[int, str],
     buffer_dets: list[list[dict]],
     person_ids: list[int],
+    *,
+    legs_visible: dict[int, bool] | None = None,
 ) -> dict[int, str]:
-    """Incluye postura en la acción (p. ej. standing and talking)."""
+    """Antepone la postura ('standing'/'sitting') SOLO cuando el VLM no la
+    mencionó (p. ej. dijo solo 'talking' o 'eating' -> 'standing and eating').
+
+    Si el texto YA trae su propia postura (p. ej. 'sit and eat', 'standing
+    and talking' — lo normal ahora que el prompt pide describir la actividad
+    real), se deja tal cual. ANTES esto se reconstruía siempre desde un set
+    cerrado de palabras clave (walk/run/sit/stand/talk/smile/phone), y
+    cualquier actividad fuera de ese set se perdía en silencio (medido:
+    "eating" quedaba reducido a solo "standing", con la persona sentada
+    comiendo reportada como si solo estuviera de pie).
+
+    `legs_visible` (pipeline de pose, ver pose_pipeline.chunk_legs_visible_by_pid):
+    si dice explícitamente False para un pid (piernas fuera de cuadro, p. ej.
+    muy cerca de la cámara), NO se antepone ninguna postura adivinada — se
+    confía en el texto del VLM tal cual, siguiendo la misma lógica que el
+    prompt (no adivinar lo que no se puede ver). Ausente del dict (sin pose,
+    o sin dato de piernas ese trozo) cae al comportamiento de siempre
+    (adivinar por forma de caja vía infer_posture_light)."""
     if not buffer_dets:
         return actions
     postures = infer_posture_light(buffer_dets, person_ids)
@@ -754,27 +775,14 @@ def enrich_action_posture(
             out[pid] = act
             continue
         tr = _action_traits(act.lower())
-        parts: list[str] = []
-        if tr["walking"]:
-            parts.append("walking")
-        elif tr["running"]:
-            parts.append("running")
-        else:
-            pos = postures.get(pid, "standing")
-            if tr["sitting"] or (pos == "sitting" and not tr["standing"]):
-                parts.append("sitting")
-            elif tr["standing"] or pos == "standing":
-                parts.append("standing")
-            elif pos == "sitting":
-                parts.append("sitting")
-        parts.extend(_action_secondary_parts(tr))
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for p in parts:
-            if p not in seen:
-                seen.add(p)
-                ordered.append(p)
-        out[pid] = " and ".join(ordered) if ordered else act
+        if tr["walking"] or tr["running"] or tr["sitting"] or tr["standing"]:
+            out[pid] = act
+            continue
+        if legs_visible is not None and legs_visible.get(pid) is False:
+            out[pid] = act
+            continue
+        pos = postures.get(pid, "standing")
+        out[pid] = f"{pos} and {act}"
     for pid, act in actions.items():
         if pid not in out:
             out[pid] = normalize_action(act)
@@ -852,18 +860,42 @@ def refine_chunk_labels(
     buffer_dets: list[list[dict]],
     person_ids: list[int],
     frame_size: tuple[int, int],
+    *,
+    moving_pids: set[int] | None = None,
+    legs_visible: dict[int, bool] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
-    """Post-proceso VLM: cinemática, postura, debias de talk grupal, social coherente."""
-    acts = apply_chunk_kinematic_hints(actions, buffer_dets, person_ids, frame_size)
-    acts = fill_unknown_actions_from_buffer(acts, buffer_dets, person_ids)
+    """Post-proceso VLM: cinemática, postura, debias de talk grupal, social coherente.
+
+    `moving_pids`/`legs_visible`: señales del pipeline de pose (marcha real +
+    piernas visibles), ver apply_chunk_kinematic_hints/enrich_action_posture.
+    Sin pose (pipeline clásico), ambos quedan en None y el comportamiento es
+    el de siempre."""
+    acts = apply_chunk_kinematic_hints(
+        actions, buffer_dets, person_ids, frame_size, moving_pids=moving_pids
+    )
     acts, social = debias_group_talking(acts, social, person_ids, buffer_dets)
-    acts = enrich_action_posture(acts, buffer_dets, person_ids)
+    acts = enrich_action_posture(acts, buffer_dets, person_ids, legs_visible=legs_visible)
     social = resolve_social_states(acts, social, person_ids)
     return acts, social
 
 
+_SINGLE_WORD_ACTION_CANON: dict[str, str] = {
+    "sit": "sitting", "sits": "sitting", "sitting": "sitting", "seated": "sitting",
+    "stand": "standing", "stands": "standing", "stood": "standing", "standing": "standing",
+    "walk": "walking", "walks": "walking", "walked": "walking", "walking": "walking",
+    "run": "running", "runs": "running", "running": "running",
+    "talk": "talking", "talks": "talking", "talking": "talking",
+}
+
+
 def normalize_action(text: str) -> str:
-    """Limpia y conserva acciones compuestas (p. ej. standing and talking)."""
+    """Limpia espacios/puntuación y canonicaliza variantes de tense/plural de
+    una sola palabra (p. ej. 'stood' -> 'standing'). Cualquier frase más
+    descriptiva se deja TAL CUAL (p. ej. 'sit and eat', 'eating a sandwich',
+    'sitting and reading') — antes se reconstruía siempre desde un set
+    cerrado de palabras clave (walk/run/sit/stand/talk/smile/phone) y
+    cualquier actividad fuera de ese set se perdía en silencio (medido:
+    "eating" quedaba reducido a solo "standing")."""
     t = " ".join(str(text).strip().split())
     if not t:
         return "unknown"
@@ -871,23 +903,8 @@ def normalize_action(text: str) -> str:
     if _is_id_label(t):
         return "unknown"
     low = t.lower()
-    if low in ("sit", "sits"):
-        return "sitting"
-    tr = _action_traits(low)
-    parts: list[str] = []
-    if tr["walking"]:
-        parts.append("walking")
-    elif tr["running"]:
-        parts.append("running")
-    elif tr["sitting"] and not tr["standing"]:
-        parts.append("sitting")
-    elif tr["standing"]:
-        parts.append("standing")
-    elif tr["sitting"]:
-        parts.append("sitting")
-    parts.extend(_action_secondary_parts(tr))
-    if parts:
-        return " and ".join(parts)
+    if low in _SINGLE_WORD_ACTION_CANON:
+        return _SINGLE_WORD_ACTION_CANON[low]
     return t
 
 
@@ -950,6 +967,12 @@ def reconcile_social_with_action(action: str, social: str) -> str:
     low = act.lower()
     tr = _action_traits(low)
     if tr["walking"] or tr["running"]:
+        # ENGAGED gana sobre MOVING si el VLM ya juzgó (en su campo 's',
+        # independiente del texto de 'a') que hay una interacción real en
+        # curso — caminar mientras se conversa/saluda a alguien es
+        # interacción, no solo tránsito.
+        if social == SOCIAL_ENGAGED:
+            return SOCIAL_ENGAGED
         return SOCIAL_MOVING
     if tr["talking"]:
         return SOCIAL_ENGAGED
@@ -958,12 +981,17 @@ def reconcile_social_with_action(action: str, social: str) -> str:
     if tr["smiling"]:
         return SOCIAL_ATTENTIVE
     if tr["sitting"] and not tr["standing"]:
-        return SOCIAL_AVAILABLE
+        # Igual que la rama "standing" de abajo: sentado sin una actividad
+        # reconocida (talking/phone/smiling ya se descartaron arriba) no debe
+        # pisar un estado social válido que el VLM ya haya dado (p. ej. BUSY
+        # para "sit and eat") — antes esto forzaba AVAILABLE siempre, perdiendo
+        # cualquier actividad fuera del set walk/talk/phone/smile.
+        if social in (SOCIAL_ENGAGED, SOCIAL_ATTENTIVE, SOCIAL_BUSY):
+            return social
+        return social if social != SOCIAL_UNKNOWN else SOCIAL_AVAILABLE
     if tr["standing"]:
-        if tr["talking"]:
-            return SOCIAL_ENGAGED
-        if tr["smiling"]:
-            return SOCIAL_ATTENTIVE
+        # talking/smiling ya se descartaron arriba (si alguno fuera True, ya
+        # habríamos retornado) — no hace falta repetir esos dos checks aquí.
         if social == SOCIAL_MOVING:
             return SOCIAL_AVAILABLE
         if social in (SOCIAL_ENGAGED, SOCIAL_ATTENTIVE, SOCIAL_BUSY):
@@ -1202,8 +1230,14 @@ def _vlm_prompt_compact(dets: list[dict], *, video: bool) -> str:
     id_map = ", ".join(f'{pid_label(d["pid"])}→"{d["pid"]}"' for d in dets)
     clip = "1s video" if video else "image"
     if use_vlm_social_states():
+        # "a" usa un placeholder (no una palabra real como "stand"/"walk") a
+        # propósito: un ejemplo con una acción real de muestra ancla al modelo
+        # a repetir ESA palabra sin importar lo que diga el texto de reglas
+        # (medido: con "stand"/"walk" de ejemplo, casi todo salía "standing"
+        # aunque la persona estuviera comiendo o mirando la cámara). "s" sí
+        # puede usar letras reales porque ese es un enum cerrado a propósito.
         example = ",".join(
-            f'"{p}":{{"a":"{"stand" if i == 0 else "walk"}","s":"{"A" if i == 0 else "M"}"}}'
+            f'"{p}":{{"a":"<action>","s":"{"A" if i == 0 else "M"}"}}'
             for i, p in enumerate(pids[:2])
         )
         if len(pids) > 2:
@@ -1211,7 +1245,7 @@ def _vlm_prompt_compact(dets: list[dict], *, video: bool) -> str:
         return VLM_PROMPTS.COMPACT_WITH_SOCIAL.format(
             clip=clip, id_map=id_map, example=example, keys=keys
         )
-    example = ",".join(f'"{p}":"stand"' for p in pids[:2])
+    example = ",".join(f'"{p}":"<action>"' for p in pids[:2])
     return VLM_PROMPTS.COMPACT_NO_SOCIAL.format(clip=clip, id_map=id_map, example=example, keys=keys)
 
 
@@ -1517,21 +1551,64 @@ def infer_actions_chunk(
     )
 
 
+def _read_video_frames_cv2(video_path: Path, target_fps: float) -> list[Image.Image]:
+    """Decodifica el clip con OpenCV y lo re-muestrea a ~target_fps.
+
+    Se usa en vez de dejar que qwen_vl_utils abra el .mp4 él mismo (decord/
+    torchvision/torchcodec, en ese orden de preferencia): los tres backends
+    exigen que la versión de ffmpeg del sistema y la de la wheel instalada
+    coincidan exactamente (torchvision.io.read_video ya no existe en
+    versiones nuevas; torchcodec/decord fallan por conflictos de libstdc++ —
+    ver .venv/bin/activate). OpenCV ya es dependencia dura del resto del
+    pipeline y decodifica el mismo archivo sin ese problema, así que evitamos
+    la clase entera de fallos pasándole los frames ya decodificados
+    (qwen_vl_utils acepta ``"video"`` como lista de imágenes, no solo ruta)."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return []
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or target_fps
+    frames_bgr: list[np.ndarray] = []
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames_bgr.append(frame)
+    finally:
+        cap.release()
+    if not frames_bgr:
+        return []
+    total = len(frames_bgr)
+    nframes = max(1, min(total, round(total / src_fps * target_fps))) if src_fps > 0 else total
+    idx = np.linspace(0, total - 1, nframes).round().astype(int)
+    return [Image.fromarray(cv2.cvtColor(frames_bgr[i], cv2.COLOR_BGR2RGB)) for i in idx]
+
+
 def _video_messages(
     video_path: Path, person_ids: list[int], dets: list[dict] | None, vfps: float
 ) -> list:
     prompt_dets = dets if dets else [{"pid": p, "x1": 0, "y1": 0, "x2": 0, "y2": 0} for p in person_ids]
-    vpath = str(video_path.resolve())
+    frames = _read_video_frames_cv2(video_path, vfps)
+    if frames:
+        video_content = {
+            "type": "video",
+            "video": frames,
+            "max_pixels": VLM_VIDEO_MAX_PIXELS,
+        }
+    else:
+        # Último recurso (no debería pasar: cv2 ya escribió este mismo
+        # archivo) — deja que qwen_vl_utils lo intente por su cuenta.
+        video_content = {
+            "type": "video",
+            "video": str(video_path.resolve()),
+            "fps": vfps,
+            "max_pixels": VLM_VIDEO_MAX_PIXELS,
+        }
     return [
         {
             "role": "user",
             "content": [
-                {
-                    "type": "video",
-                    "video": vpath,
-                    "fps": vfps,
-                    "max_pixels": VLM_VIDEO_MAX_PIXELS,
-                },
+                video_content,
                 {"type": "text", "text": vlm_prompt(prompt_dets, video=True)},
             ],
         }

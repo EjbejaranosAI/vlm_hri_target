@@ -30,3 +30,9 @@ input_videos/*
 
 # Sistema
 .DS_Store
+
+# Herramientas/skills de asistentes de IA (config local, no del proyecto)
+.agents/
+.claude/
+.lsp/
+skills-lock.json

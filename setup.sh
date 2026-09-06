@@ -31,6 +31,24 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+# Si este venv se creó sobre un python de conda (symlink con RPATH a
+# miniconda3/lib), su libstdc++.so.6 es más viejo que el del sistema y hace
+# fallar la carga de librerías de ffmpeg del sistema (torchcodec/torchvision:
+# "GLIBCXX_3.4.32 not found"). Se precarga el libstdc++ del sistema en
+# bin/activate para evitarlo, de forma idempotente.
+_SYS_LIBSTDCXX="/usr/lib/x86_64-linux-gnu/libstdc++.so.6"
+if [ -f "$_SYS_LIBSTDCXX" ] && ! grep -q "_SYS_LIBSTDCXX" "$VENV_DIR/bin/activate"; then
+    cat >> "$VENV_DIR/bin/activate" <<EOF
+
+_SYS_LIBSTDCXX="$_SYS_LIBSTDCXX"
+if [ -f "\$_SYS_LIBSTDCXX" ]; then
+    export LD_PRELOAD="\${_SYS_LIBSTDCXX}\${LD_PRELOAD:+:\$LD_PRELOAD}"
+fi
+unset _SYS_LIBSTDCXX
+EOF
+fi
+unset _SYS_LIBSTDCXX
+
 echo
 echo "== Instalando dependencias =="
 pip install --upgrade pip

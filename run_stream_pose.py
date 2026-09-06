@@ -55,6 +55,10 @@ ROOT = P.ROOT
 
 STREAM_OUTPUT_DIR = Path(os.environ.get("STREAM_POSE_OUTPUT_DIR", str(ROOT / "output")))
 
+# Factor de escala SOLO para la ventana de --display (cv2.imshow) — no afecta
+# la resolución real usada por YOLO/VLM ni lo que se guarda a disco.
+DISPLAY_SCALE = float(os.environ.get("DISPLAY_SCALE", "2.0"))
+
 
 @dataclass
 class RawFrame:
@@ -430,7 +434,11 @@ def run(
                         yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
                         pipeline_total_s=time.perf_counter() - t_pipeline0, vlm_pending=vlm_pending,
                     )
-                    cv2.imshow("stream-pose", preview_ann)
+                    display_ann = cv2.resize(
+                        preview_ann, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE,
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    cv2.imshow("stream-pose", display_ann)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
                 except cv2.error:

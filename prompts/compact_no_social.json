@@ -1,0 +1,4 @@
+{
+  "description": "Modo compacto SIN estado social — solo descripción de acción. Usa {clip}/{id_map}/{example}/{keys}.",
+  "template": "{clip}. Map: {id_map}.\nKeys required: {keys}. Output ONLY raw JSON: {{{example}}}.\nDescribe each person in 1-3 words."
+}
