@@ -24,9 +24,11 @@ from ..config import YOLO_CONF, YOLO_IOU, YOLO_MAX_DET, YOLO_POST_NMS_IOU
 from ..detection import box_iou, nms_boxes, sort_dets_left_right
 from ..drawing import pid_label, ui_scale
 from ..motion import chunk_motion_by_pid, refine_chunk_labels
+from ..clustering import same_cluster
 from ..social_state import (
     SOCIAL_ATTENTIVE,
     SOCIAL_AVAILABLE,
+    SOCIAL_ENGAGED,
     SOCIAL_MOVING,
     SOCIAL_UNKNOWN,
     normalize_social_state,
@@ -471,6 +473,52 @@ def _strip_walking_words(act: str) -> str:
     return out.strip() or "unknown"
 
 
+def check_engaged_proximity(
+    actions: dict[int, str],
+    social: dict[int, str],
+    person_ids: list[int],
+    world_xy: dict[int, tuple[float, float]] | None,
+    clusters: dict[int, int] | None,
+    *,
+    max_dist_m: float | None = None,
+) -> dict[int, str]:
+    """Corrige ENGAGED con la posición real (LiDAR), no solo el juicio del
+    VLM/heurística sobre la imagen: alguien solo puede estar "hablando con
+    otra persona" (ENGAGED) si hay AL MENOS otra persona ENGAGED en su mismo
+    cluster de proximidad (`clusters`, ver vlm_hri.clustering). Sin eso, se
+    baja a ATTENTIVE -- mismo espíritu que upgrade_attentive_by_gaze (exigir
+    evidencia positiva, no solo "no desmentido"), pero con evidencia espacial
+    real en vez de pose.
+
+    Solo aplica en el pipeline ROS2 (con tracker LiDAR externo) -- sin
+    `world_xy`/`clusters` (cámara/video plano, sin posición real) es un no-op,
+    igual que el resto de este pipeline se comporta hoy. Desactivable con
+    STRICT_ENGAGED_PROXIMITY=0."""
+    if not world_xy or not clusters:
+        return social
+    if os.environ.get("STRICT_ENGAGED_PROXIMITY", "1") != "1":
+        return social
+    engaged = [
+        pid for pid in person_ids
+        if normalize_social_state(str(social.get(pid, ""))) == SOCIAL_ENGAGED
+    ]
+    if len(engaged) < 2:
+        # Nadie mas ENGAGED en absoluto -> ninguno tiene con quien "hablar".
+        out = dict(social)
+        for pid in engaged:
+            out[pid] = SOCIAL_ATTENTIVE
+        return out
+    out = dict(social)
+    for pid in engaged:
+        corroborated = any(
+            other != pid and same_cluster(pid, other, clusters)
+            for other in engaged
+        )
+        if not corroborated:
+            out[pid] = SOCIAL_ATTENTIVE
+    return out
+
+
 # Cuántos trozos (~1s cada uno) se mantiene "moviéndose" tras la última
 # evidencia real, para no perderlo en trozos donde la señal se ahoga en ruido
 # (p. ej. alguien lejos, caja chica) — sin esto, un par de trozos "ciegos"
@@ -801,6 +849,8 @@ def refine_labels_pose(
     frame_size: tuple[int, int],
     *,
     moving_pids_hint: set[int] | None = None,
+    world_xy: dict[int, tuple[float, float]] | None = None,
+    clusters: dict[int, int] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
     """Combina tres señales de movimiento en vez de una sola:
     1. El VLM ya vio la pose+color como pista y decidió con eso.
@@ -853,10 +903,12 @@ def refine_labels_pose(
     # torso/cara en el frame), refine_chunk_labels no debe adivinar postura —
     # se confía en lo que el VLM describió (ver enrich_action_posture).
     legs_visible = chunk_legs_visible_by_pid(compensated, person_ids)
-    return refine_chunk_labels(
+    actions, social = refine_chunk_labels(
         actions, social, compensated, person_ids, frame_size,
         moving_pids=confirmed_moving, legs_visible=legs_visible,
     )
+    social = check_engaged_proximity(actions, social, person_ids, world_xy, clusters)
+    return actions, social
 
 
 def upgrade_attentive_by_gaze(
