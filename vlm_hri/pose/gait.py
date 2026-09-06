@@ -18,10 +18,11 @@ import os
 import cv2
 import numpy as np
 
-from ..actions import _action_traits, normalize_action
+from ..actions import _action_secondary_parts, _action_traits, normalize_action
 from ..config import YOLO_CONF, YOLO_IOU, YOLO_MAX_DET, YOLO_POST_NMS_IOU
 from ..detection import box_iou, nms_boxes, sort_dets_left_right
 from ..drawing import pid_label
+from ..motion import chunk_motion_by_pid, refine_chunk_labels
 from ..social_state import SOCIAL_ATTENTIVE, SOCIAL_AVAILABLE, SOCIAL_UNKNOWN
 from ..vlm.prompts import MOTION_COLOR_HINT, vlm_prompt
 
@@ -32,8 +33,6 @@ from ..vlm.prompts import MOTION_COLOR_HINT, vlm_prompt
 # más grande) — quien está lejos importa menos para elegir con quién
 # interactuar. Parámetro (no una constante quemada) para poder ampliarlo el
 # día que se necesite atender a más gente a la vez.
-MAX_VLM_PEOPLE = int(os.environ.get("MAX_VLM_PEOPLE", "10"))
-
 MAX_VLM_PEOPLE = int(os.environ.get("MAX_VLM_PEOPLE", "10"))
 
 
@@ -598,3 +597,80 @@ def pick_interaction_target(
         return None
     candidates.sort()
     return candidates[0][2]
+
+
+def refine_labels_pose(
+    actions: dict[int, str],
+    social: dict[int, str],
+    buffer_dets: list[list[dict]],
+    person_ids: list[int],
+    frame_size: tuple[int, int],
+    *,
+    moving_pids_hint: set[int] | None = None,
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Combina tres señales de movimiento en vez de una sola:
+    1. El VLM ya vio la pose+color como pista y decidió con eso.
+    2. El respaldo determinístico por cinemática de caja de pipeline.py
+       (bbox-center, recalibrado).
+    3. `moving_pids_hint`: marcha por piernas + cambio de profundidad de la
+       caja + histéresis temporal (pose_pipeline.py), calculado en Fase 1.
+    Si CUALQUIERA de las tres dice "se mueve", se respeta — medido: dejar
+    todo en manos de una sola señal (el VLM+pista) perdía el caso difícil de
+    caminata de frente a cámara.
+
+    ANTES de eso, se corrige el sesgo contrario: el VLM a veces le pega
+    "walking" a TODO el grupo a la vez sin que nadie se haya movido de verdad
+    (medido: 4/5 personas "walking" con 3-36px de desplazamiento total en 60
+    frames — nada). Si eso pasa, solo se respeta a quien SÍ tiene evidencia
+    cinemática independiente."""
+    # El respaldo por cinemática de caja de pipeline.py mide posición ABSOLUTA
+    # en la imagen — si la cámara se mueve un poco (temblor, paneo), todas las
+    # cajas se desplazan igual y parece que todo el mundo camina. Se le pasa
+    # una copia con ese movimiento común (mediana entre personas) ya restado.
+    compensated = compensate_camera_motion(buffer_dets)
+    bbox_confirmed = set(
+        chunk_motion_by_pid(compensated, person_ids, frame_size).keys()
+    )
+    confirmed_moving = (moving_pids_hint or set()) | bbox_confirmed
+    actions, social = debias_group_walking(actions, social, person_ids, confirmed_moving)
+
+    if moving_pids_hint:
+        for pid in moving_pids_hint:
+            if pid not in actions:
+                continue
+            act = normalize_action(actions[pid])
+            tr = _action_traits(act.lower())
+            if not tr.get("walking"):
+                extras = _action_secondary_parts(tr)
+                actions[pid] = " and ".join(["walking"] + extras) if extras else "walking"
+
+    # Piernas visibles: si NO lo están (persona muy cerca de la cámara, solo
+    # torso/cara en el frame), refine_chunk_labels no debe adivinar postura —
+    # se confía en lo que el VLM describió (ver enrich_action_posture).
+    legs_visible = chunk_legs_visible_by_pid(compensated, person_ids)
+    return refine_chunk_labels(
+        actions, social, compensated, person_ids, frame_size,
+        moving_pids=confirmed_moving, legs_visible=legs_visible,
+    )
+
+
+def upgrade_attentive_by_gaze(
+    social: dict[int, str], buffer_dets: list[list[dict]], person_ids: list[int]
+) -> dict[int, str]:
+    """Corrige ATTENTIVE con la mirada real (marcha por pose, no el juicio
+    suelto del VLM sobre "orientado a cámara"):
+    - AVAILABLE → ATTENTIVE si SÍ mira de frente la mayoría del trozo.
+    - ATTENTIVE → AVAILABLE si el VLM la puso pero la pose confirma que NO
+      mira de frente (medido: el VLM a veces marca ATTENTIVE con la persona
+      mirando a otro lado, basta con estar de pie/quieta orientada hacia la
+      cámara en general).
+    No toca ENGAGED/BUSY/MOVING, que ya son más específicos que ATTENTIVE."""
+    facing = chunk_facing_camera_by_pid(buffer_dets, person_ids)
+    out = dict(social)
+    for pid, is_facing in facing.items():
+        cur = out.get(pid)
+        if is_facing and cur == SOCIAL_AVAILABLE:
+            out[pid] = SOCIAL_ATTENTIVE
+        elif not is_facing and cur == SOCIAL_ATTENTIVE:
+            out[pid] = SOCIAL_AVAILABLE
+    return out
