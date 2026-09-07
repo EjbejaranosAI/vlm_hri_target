@@ -90,12 +90,29 @@ def use_vlm_social_states() -> bool:
     return social_state_mode() == "vlm"
 
 
+# Subconjunto de _SOCIAL_ALIASES que son puramente un juicio de estado
+# abstracto (nunca una actividad concreta observable) -- _SOCIAL_ALIASES
+# completo NO sirve aquí: incluye "phone"/"reading"/"conversation", que SÍ
+# son acciones válidas y específicas (justo lo que se le pide al VLM en 'a'),
+# no vocabulario social colado por error.
+_PURE_SOCIAL_ALIASES = {
+    "available", "free", "idle", "interruptible",
+    "attentive", "aware", "receptive",
+    "busy", "occupied",
+    "engaged",
+    "moving", "motion", "locomotion",
+}
+
+
 def _is_social_vocabulary(word: str) -> bool:
-    """True si la palabra es un estado social, no una acción observable."""
+    """True si la palabra es un estado social, no una acción observable --
+    incluye tanto la palabra completa ("moving") como la letra suelta del
+    formato compacto ("M"), que a veces se cuela como si fuera 'a' cuando el
+    VLM no la unió con la acción por una coma (formato "accion,M")."""
     low = word.lower().strip()
-    if low in ("available", "attentive", "engaged", "moving"):
+    if low in ("a", "t", "b", "e", "m"):
         return True
-    return low in _SOCIAL_ALIASES
+    return low in _PURE_SOCIAL_ALIASES
 
 
 def coerce_action_social(action: str, social: str) -> tuple[str, str]:
@@ -182,6 +199,14 @@ def reconcile_social_with_action(action: str, social: str) -> str:
     derived = action_to_social_state(act)
     if derived != SOCIAL_UNKNOWN:
         return derived
+    if social == SOCIAL_MOVING:
+        # Ya se descartó walking/running arriba -- el texto de 'a' no tiene
+        # ningún indicio de movimiento. Un 's':M del VLM aquí es inconsistente
+        # con su propia descripción de la acción (se le pasan varios frames
+        # del clip precisamente para que juzgue el movimiento ahí; MOVING solo
+        # tiene sentido si la acción en sí lo muestra). Sin ese respaldo, no
+        # se acepta -- mismo criterio que "sin evidencia, no se corrige".
+        return SOCIAL_UNKNOWN
     return social if social != SOCIAL_UNKNOWN else SOCIAL_UNKNOWN
 
 

@@ -19,7 +19,7 @@ import re
 import cv2
 import numpy as np
 
-from ..actions import _action_secondary_parts, _action_traits, normalize_action
+from ..actions import _action_traits, normalize_action
 from ..config import YOLO_CONF, YOLO_IOU, YOLO_MAX_DET, YOLO_POST_NMS_IOU
 from ..detection import box_iou, nms_boxes, sort_dets_left_right
 from ..drawing import pid_label, ui_scale
@@ -424,22 +424,22 @@ def require_moving_evidence(
     social: dict[int, str],
     confirmed_moving: set[int],
 ) -> tuple[dict[int, str], dict[int, str]]:
-    """Modo rígido (default): CUALQUIER "walking"/"running" — venga del VLM
-    o de un forzado anterior — sin evidencia cinemática independiente
-    confirmada (`confirmed_moving`: marcha real + profundidad + histéresis
-    de varios trozos, o respaldo bbox-center) se quita, sin importar cuántas
-    personas haya en cuadro.
+    """Modo rígido (desactivado por defecto): CUALQUIER "walking"/"running"
+    que dijo el VLM, sin evidencia cinemática independiente confirmada
+    (`confirmed_moving`: marcha real + profundidad + histéresis de varios
+    trozos, o respaldo bbox-center) se quita, sin importar cuántas personas
+    haya en cuadro.
 
-    `debias_group_walking` solo corrige el sesgo cuando el GRUPO entero se
-    marca caminando a la vez (necesita 2+ personas y que la mayoría lo diga)
-    — deja sin cubrir el caso más común de falso positivo: una sola persona
-    en cuadro (sin "grupo" que debiasear) a la que el VLM le pega "walking"
-    de pura alucinación, o a la que la pose confirma solo por 2-3 trozos
-    seguidos (afinado, pero no infalible). Aquí se exige la misma evidencia
-    para cualquiera, esté solo o en grupo. Desactivable con
-    STRICT_MOVING_EVIDENCE=0 si en la práctica pierde demasiadas caminatas
-    reales (falsos negativos)."""
-    if os.environ.get("STRICT_MOVING_EVIDENCE", "1") != "1":
+    Por defecto OFF: el VLM ya ve el clip de varios frames para juzgar el
+    movimiento él mismo, y nuestra propia señal de marcha tiene puntos
+    ciegos conocidos (de frente/espaldas a cámara, ver README) -- exigirla
+    SIEMPRE le quitaba caminatas reales que el VLM sí había visto bien
+    (medido: degradaba la calidad más de lo que corregía). `debias_group_walking`
+    ya cubre el sesgo real y medido (el VLM le pega "walking" a TODO el grupo
+    a la vez sin que nadie se haya movido). Activable con
+    STRICT_MOVING_EVIDENCE=1 si en la práctica el VLM alucina "walking" en
+    solitario sin evidencia (falsos positivos)."""
+    if os.environ.get("STRICT_MOVING_EVIDENCE", "0") == "0":
         return actions, social
     out_a = dict(actions)
     out_s = dict(social)
@@ -852,21 +852,16 @@ def refine_labels_pose(
     world_xy: dict[int, tuple[float, float]] | None = None,
     clusters: dict[int, int] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
-    """Combina tres señales de movimiento en vez de una sola:
-    1. El VLM ya vio la pose+color como pista y decidió con eso.
-    2. El respaldo determinístico por cinemática de caja de vlm_hri.motion
-       (bbox-center, recalibrado).
-    3. `moving_pids_hint`: marcha por piernas + cambio de profundidad de la
-       caja + histéresis temporal (este módulo), calculado en Fase 1.
-    Si CUALQUIERA de las tres dice "se mueve", se respeta — medido: dejar
-    todo en manos de una sola señal (el VLM+pista) perdía el caso difícil de
-    caminata de frente a cámara.
-
-    ANTES de eso, se corrige el sesgo contrario: el VLM a veces le pega
-    "walking" a TODO el grupo a la vez sin que nadie se haya movido de verdad
-    (medido: 4/5 personas "walking" con 3-36px de desplazamiento total en 60
-    frames — nada). Si eso pasa, solo se respeta a quien SÍ tiene evidencia
-    cinemática independiente."""
+    """MOVING/"walking" viene del VLM: se le pasa el clip de varios frames
+    (y, como pista visual aparte, la caja azul/roja de marcha detectada) para
+    que juzgue el movimiento él mismo -- este refinamiento ya NO fuerza
+    "walking" sobre lo que el VLM describió, ni se lo quita, salvo un caso:
+    el sesgo de grupo conocido (el VLM le pega "walking" a TODO el grupo a la
+    vez sin que nadie se haya movido de verdad -- medido: 4/5 personas
+    "walking" con 3-36px de desplazamiento total en 60 frames, nada). Ahí sí
+    se corrige, y solo se exceptúa a quien tiene evidencia cinemática
+    independiente (`confirmed_moving`, usada también en el hint de color del
+    prompt, nunca para reescribir el texto de la acción)."""
     # El respaldo por cinemática de caja de vlm_hri.motion mide posición ABSOLUTA
     # en la imagen — si la cámara se mueve un poco (temblor, paneo), todas las
     # cajas se desplazan igual y parece que todo el mundo camina. Se le pasa
@@ -896,29 +891,17 @@ def refine_labels_pose(
     actions, social = debias_group_walking(actions, social, person_ids, confirmed_moving)
     actions, social = require_moving_evidence(actions, social, confirmed_moving)
 
-    if moving_pids_confirmed:
-        for pid in moving_pids_confirmed:
-            if pid not in actions:
-                continue
-            act = normalize_action(actions[pid])
-            tr = _action_traits(act.lower())
-            if tr.get("sitting") and not tr.get("standing"):
-                # Sentado y caminando son físicamente incompatibles. Si el VLM
-                # ya describió a esta persona como sentada, no se le fuerza
-                # "walking" encima aunque la cinemática (gait/profundidad) lo
-                # sugiera — es mucho más probable que sea ruido de esa señal
-                # (gesticular, inclinarse a comer/alcanzar algo) que alguien
-                # caminando sentado. Mismo criterio que ya usa
-                # vlm_hri.motion.apply_chunk_kinematic_hints (clearly_sitting)
-                # para el mismo caso en el pipeline sin pose — aquí faltaba.
-                continue
-            if not tr.get("walking"):
-                extras = _action_secondary_parts(tr)
-                actions[pid] = " and ".join(["walking"] + extras) if extras else "walking"
-
+    # Ya NO se fuerza "walking" en el texto de la acción a partir de la señal
+    # cinemática -- el VLM ve el clip completo (varios frames) más la pista
+    # de color, y decide él. moving_pids=set() (no None) apaga también el
+    # respaldo bbox-center de apply_chunk_kinematic_hints (si se dejara en
+    # None, caería a ESE otro forzado en vez de a ninguno). `confirmed_moving`
+    # sigue calculándose arriba solo para debias_group_walking/
+    # require_moving_evidence (corregir sesgo conocido, no para escribir
+    # el texto).
     actions, social = refine_chunk_labels(
         actions, social, compensated, person_ids, frame_size,
-        moving_pids=confirmed_moving, legs_visible=legs_visible,
+        moving_pids=set(), legs_visible=legs_visible,
     )
     social = check_engaged_proximity(actions, social, person_ids, world_xy, clusters)
     return actions, social

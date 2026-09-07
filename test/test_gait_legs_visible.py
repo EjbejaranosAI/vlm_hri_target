@@ -78,11 +78,14 @@ def _standing_kpts() -> np.ndarray:
     return kpts
 
 
-def test_depth_only_hint_is_ignored_but_real_gait_still_works():
-    """Control: con piernas SÍ visibles, el hint sigue forzando "walking"
-    como antes (no se rompió el caso bueno) -- aquí no importa si
-    chunk_gait_by_pid por sí solo detectaría marcha real; se simula que
-    Fase 1 ya decidió "se mueve" (moving_pids_hint), igual que en producción."""
+def test_kinematic_hint_never_rewrites_the_vlm_text_even_with_real_gait():
+    """El VLM ya ve el clip de varios frames (+ pista de color) y decide el
+    movimiento él mismo -- ni con evidencia cinemática real y confirmada
+    (piernas visibles, moving_pids_hint activo) se le reescribe el texto de
+    la acción. `moving_pids_hint`/`confirmed_moving` solo sirven para
+    corregir el sesgo de grupo conocido (debias_group_walking) y para la
+    pista de color del prompt, nunca para inyectar/quitar "walking" del
+    texto -- ver refine_labels_pose."""
     buffer_dets = [
         [{"pid": 2, "x1": 100, "y1": 100, "x2": 200, "y2": 300, "kpts": _standing_kpts()}]
         for _ in range(10)
@@ -94,4 +97,8 @@ def test_depth_only_hint_is_ignored_but_real_gait_still_works():
         actions, social, buffer_dets, [2], frame_size=(640, 480), moving_pids_hint={2}
     )
 
-    assert "walking" in acts[2].lower(), acts
+    # enrich_action_posture puede anteponer "standing"/"sitting" inferido de
+    # la caja (eso es aparte, y sigue activo) -- lo que NO debe pasar es que
+    # "walking" aparezca en el texto solo por la señal cinemática.
+    assert "watch camera" in acts[2], acts
+    assert "walking" not in acts[2].lower(), acts
