@@ -872,15 +872,32 @@ def refine_labels_pose(
     # cajas se desplazan igual y parece que todo el mundo camina. Se le pasa
     # una copia con ese movimiento común (mediana entre personas) ya restado.
     compensated = compensate_camera_motion(buffer_dets)
+
+    # Piernas visibles: si NO lo están (persona muy cerca de la cámara, solo
+    # torso/cara en el frame), no hay marcha real que evaluar -- chunk_gait_by_pid
+    # ya no pudo haber aportado nada a moving_pids_hint ese pid (necesita
+    # rodilla/cadera/tobillo con confianza), así que cualquier "moviéndose" ahí
+    # viene SOLO de chunk_depth_motion_by_pid (cambio de alto de caja,
+    # EXPERIMENTAL/sin calibrar -- ver su docstring: se confunde con
+    # gesticular/inclinarse comiendo/con el teléfono/hablando por teléfono
+    # sentado). Sin marcha real que confirmar, ese hint NO basta para forzar
+    # "walking" -- se filtra ANTES de combinarlo con el resto de señales,
+    # tanto aquí como en vlm_hri.motion.apply_chunk_kinematic_hints (vía
+    # refine_chunk_labels más abajo).
+    legs_visible = chunk_legs_visible_by_pid(compensated, person_ids)
+    moving_pids_confirmed = {
+        pid for pid in (moving_pids_hint or set()) if legs_visible.get(pid) is not False
+    }
+
     bbox_confirmed = set(
         chunk_motion_by_pid(compensated, person_ids, frame_size).keys()
     )
-    confirmed_moving = (moving_pids_hint or set()) | bbox_confirmed
+    confirmed_moving = moving_pids_confirmed | bbox_confirmed
     actions, social = debias_group_walking(actions, social, person_ids, confirmed_moving)
     actions, social = require_moving_evidence(actions, social, confirmed_moving)
 
-    if moving_pids_hint:
-        for pid in moving_pids_hint:
+    if moving_pids_confirmed:
+        for pid in moving_pids_confirmed:
             if pid not in actions:
                 continue
             act = normalize_action(actions[pid])
@@ -899,10 +916,6 @@ def refine_labels_pose(
                 extras = _action_secondary_parts(tr)
                 actions[pid] = " and ".join(["walking"] + extras) if extras else "walking"
 
-    # Piernas visibles: si NO lo están (persona muy cerca de la cámara, solo
-    # torso/cara en el frame), refine_chunk_labels no debe adivinar postura —
-    # se confía en lo que el VLM describió (ver enrich_action_posture).
-    legs_visible = chunk_legs_visible_by_pid(compensated, person_ids)
     actions, social = refine_chunk_labels(
         actions, social, compensated, person_ids, frame_size,
         moving_pids=confirmed_moving, legs_visible=legs_visible,
