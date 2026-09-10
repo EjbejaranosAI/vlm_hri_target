@@ -375,6 +375,29 @@ class PoseStreamSession:
         self.chunk_raw.append(rf)
         return rf
 
+    def render_current(self, rf: RawFrame) -> np.ndarray:
+        """Renderiza `rf` con el último estado (acción/social) ya conocido --
+        para publicar cada frame en cuanto llega (ver vlm_hri/ros/node.py),
+        en vez de esperar a que el VLM termine todo el trozo y volcar de
+        golpe ~chunk_frames imágenes seguidas (se ve "cortado"/a saltos en un
+        consumidor en vivo, aunque en un mp4 grabado no se note porque el
+        archivo lleva su propio fps de reproducción)."""
+        with self.state.lock:
+            actions = dict(self.state.actions)
+            social_states = dict(self.state.social_states)
+            yolo_acum = self.state.yolo_total_s
+            vlm_acum = self.state.vlm_total_s
+            vlm_n = self.state.vlm_calls
+            vlm_pending = self.state.vlm_pending
+        return render_pose_frame(
+            rf, actions, social_states,
+            w=self.w, h=self.h, fps=self.fps, chunk_sec=self.chunk_sec,
+            chunk_index=self.chunk_i, chunk_count=max(self.chunk_i, vlm_n),
+            yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
+            pipeline_total_s=time.perf_counter() - self.t_pipeline0, vlm_pending=vlm_pending,
+            draw_pose=self.draw_pose,
+        )
+
     def tick(self, elapsed_s: float = 0.0) -> None:
         """Contabilidad + chequeo de límite de trozo -- llamar una vez por
         frame, después de `append_frame()` (y de cualquier render de vista

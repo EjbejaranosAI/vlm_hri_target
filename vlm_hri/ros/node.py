@@ -110,6 +110,7 @@ class VlmHriNode(Node):
 
         self._session: PoseStreamSession | None = None
         self._session_lock = threading.Lock()
+        self._ros_sink: RosPublisherSink | None = None
 
         image_msg_type = CompressedImage if self._image_compressed else Image
         kind = "CompressedImage" if self._image_compressed else "Image"
@@ -140,6 +141,7 @@ class VlmHriNode(Node):
                 if self._yolo_pose is not None:
                     warmup_yolo(self._yolo_pose, shape=(h, w, 3))
                 sink = RosPublisherSink(self, frame_id=self._frame_id)
+                self._ros_sink = sink
                 self._session = PoseStreamSession(
                     w=w, h=h, fps=self._assumed_fps, chunk_sec=self._chunk_sec,
                     chunk_dir=self._chunk_dir, vlm=self._vlm, processor=self._processor,
@@ -164,8 +166,10 @@ class VlmHriNode(Node):
             pose_raw = pose_gait.detect_people_pose(self._yolo_pose, frame)
             pose_gait.attach_pose_keypoints(dets, pose_raw)
 
-        session.append_frame(frame, dets)
+        rf = session.append_frame(frame, dets)
         session.tick()
+        if self._ros_sink is not None:
+            self._ros_sink.publish_frame(session.render_current(rf))
 
     def _on_image_only(self, image_msg: Image | CompressedImage) -> None:
         """Sin dynamic_tracking: detección+tracking propios (mismo criterio
@@ -184,8 +188,10 @@ class VlmHriNode(Node):
             pose_raw = pose_gait.detect_people_pose(self._yolo_pose, frame)
             pose_gait.attach_pose_keypoints(dets, pose_raw)
 
-        session.append_frame(frame, dets)
+        rf = session.append_frame(frame, dets)
         session.tick()
+        if self._ros_sink is not None:
+            self._ros_sink.publish_frame(session.render_current(rf))
 
     def destroy_node(self) -> None:
         if self._session is not None:

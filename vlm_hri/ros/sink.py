@@ -36,11 +36,20 @@ class RosPublisherSink:
         self._social_pub = node.create_publisher(String, f"{topic_prefix}/social_states", 10)
         self._target_pub = node.create_publisher(PoseStamped, f"{topic_prefix}/target_pose", 10)
 
-    def write_frame(self, ann: np.ndarray) -> None:
+    def publish_frame(self, ann: np.ndarray) -> None:
+        """Publica un frame ya renderizado -- llamado directamente por el
+        nodo una vez por cada frame recibido (ver PoseStreamSession.
+        render_current), a la velocidad real de la cámara. No pasa por
+        write_frame/_flush_chunk_to_sinks: eso solo se dispara una vez por
+        trozo (~1s) cuando el VLM termina, lo que publicaría de golpe todo
+        el trozo en ráfaga en vez de en vivo."""
         msg = self._bridge.cv2_to_imgmsg(ann, encoding="bgr8")
         msg.header = Header(frame_id=self._frame_id)
         msg.header.stamp = self._node.get_clock().now().to_msg()
         self._image_pub.publish(msg)
+
+    def write_frame(self, ann: np.ndarray) -> None:
+        pass  # ver publish_frame -- el nodo publica en vivo, no en ráfaga por trozo
 
     def write_social_update(
         self,
