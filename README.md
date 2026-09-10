@@ -117,21 +117,41 @@ alimenta la misma sesión de streaming que usa `python main.py stream`.
 **Requiere un entorno con `numpy<2`.** `cv_bridge` (parte de ROS2) está
 compilado contra NumPy 1.x; el `.venv` de este repo usa NumPy 2.x para
 torch/ultralytics, y con eso `cv_bridge` falla al importar. Mismo problema
-(y misma solución) que ya documenta `dynamic-tracking/README.md`: usa un
-venv aparte con `numpy<2` para correr el nodo, o instala las dependencias de
-`requirements.txt` con `numpy<2` en un entorno dedicado a ROS2. El `.venv`
+(y misma solución) que ya documenta `dynamic-tracking/README.md`. El `.venv`
 normal (numpy 2.x) sigue sirviendo para `main.py` (CLI) sin tocar nada.
 
+Setup verificado (venv `--system-site-packages` para heredar `rclpy`/
+`cv_bridge`/`vision_msgs`/`message_filters` del sistema, + numpy<2 propio):
+
 ```bash
-# en un venv/entorno con numpy<2 y acceso a los paquetes de ROS2 (rclpy,
-# cv_bridge, vision_msgs, message_filters, ament_index_python, launch)
-cd ~/ros_ws   # workspace con dynamic_tracking y este repo en src/
-colcon build --packages-select vlm_hri_target
+python3 -m venv --system-site-packages .venv_ros
+source .venv_ros/bin/activate
+pip install "numpy<2" -r requirements.txt   # requirements.txt no fija numpy; con esta venv resuelve <2
+
+# symlink del repo en el workspace de colcon (junto a dynamic_tracking)
+ln -s "$(pwd)" ~/ros2_ws/src/vlm_hri_target
+
+source /opt/ros/jazzy/setup.bash
+cd ~/ros2_ws
+python3 -m colcon build --symlink-install --packages-select vlm_hri_target
 source install/setup.bash
 
 ros2 launch vlm_hri_target vlm_hri.launch.py profile:=sim   # Gazebo
 ros2 launch vlm_hri_target vlm_hri.launch.py profile:=robot # TIAGO real
 ```
+
+Usar `python3 -m colcon build` (no el script `colcon` del sistema) desde
+dentro del venv activado es lo que hace que el script `vlm_hri_node`
+generado tenga el shebang del venv (con torch/ultralytics/transformers)
+en vez del Python del sistema.
+
+Probado end-to-end en esta máquina (sin TIAGO/Gazebo real, con
+`Image`+`Detection2DArray` sintéticos publicados a mano): el nodo carga
+YOLO-pose + VLM, sincroniza ambos tópicos, corre el mismo pipeline de
+refinamiento que el CLI (~0.7s/trozo, en línea con los tiempos de
+`main.py videos`) y publica correctamente en los 3 tópicos de salida,
+incluida la posición LiDAR (`map_x`/`map_y`) y el `cluster_id`. Falta la
+validación contra la cámara/LiDAR reales del TIAGO o Gazebo.
 
 Tópicos publicados (`config/vlm_hri_params_{sim,robot}.yaml` fija
 `frame_id: map` en sim / `odom` en robot, igual que `tracking_frame` en

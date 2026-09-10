@@ -1,6 +1,12 @@
 # Entorno virtual (lo crea setup.sh, no se versiona)
 .venv/
 venv/
+.venv_ros/
+
+# Artefactos de colcon build (si se corre desde aquí en vez de un workspace aparte)
+build/
+install/
+log/
 
 # Cache de Python
 __pycache__/
