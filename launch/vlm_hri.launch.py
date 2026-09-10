@@ -29,6 +29,7 @@ def _launch_setup(context, *args, **kwargs):
     node_params = {
         "image_topic": LaunchConfiguration("image_topic"),
         "detections_topic": LaunchConfiguration("detections_topic"),
+        "use_dynamic_tracking": LaunchConfiguration("use_dynamic_tracking"),
         "use_pose": LaunchConfiguration("use_pose"),
         "draw_pose": LaunchConfiguration("draw_pose"),
     }
@@ -64,7 +65,13 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "detections_topic",
                 default_value="/detections/tracked",
-                description="Salida de dynamic_tracking (vision_msgs/Detection2DArray, con track_id + posición real)",
+                description="Salida de dynamic_tracking (vision_msgs/Detection2DArray, con track_id + posición real). Ignorado si use_dynamic_tracking:=false",
+            ),
+            DeclareLaunchArgument(
+                "use_dynamic_tracking",
+                default_value="true",
+                description="true: detecciones+posición real vía dynamic_tracking (detections_topic). "
+                "false: solo cámara -- detección/tracking propios, sin posición real (sin clustering/proximidad LiDAR)",
             ),
             DeclareLaunchArgument(
                 "use_pose",

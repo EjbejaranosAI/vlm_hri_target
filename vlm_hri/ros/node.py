@@ -1,10 +1,18 @@
-"""Nodo ROS2: sustituye la cámara/detección/tracking propios del CLI por los
-de dynamic-tracking (LiDAR 360° + YOLO auxiliar, ver
-/home/edison/Desktop/PhD/RAL2026/dynamic-tracking) -- se suscribe a la imagen
-cruda del robot y a /detections/tracked (vision_msgs/Detection2DArray, ya con
-track_id estable y posición real en el mundo), corre localmente SOLO el
-modelo de pose (para marcha/gait -- dynamic_tracking no hace pose), y
-alimenta el mismo PoseStreamSession que usa `python main.py stream`.
+"""Nodo ROS2: dos modos de entrada, elegidos con el parámetro
+`use_dynamic_tracking` (default true):
+
+- true (con dynamic-tracking, ver /home/edison/Desktop/PhD/RAL2026/dynamic-tracking):
+  se suscribe a la imagen cruda del robot y a /detections/tracked
+  (vision_msgs/Detection2DArray, ya con track_id estable y posición real en
+  el mundo vía LiDAR 360°+YOLO auxiliar), y corre localmente SOLO el modelo
+  de pose (para marcha/gait -- dynamic_tracking no hace pose).
+- false (solo cámara, sin dynamic_tracking): se suscribe SOLO a la imagen y
+  hace su propia detección+tracking de personas (mismo `detect_people` +
+  `track_detections`/`assign_spatial_ids` que usa `main.py stream --camera`)
+  -- sin posición real, así que el clustering/proximidad LiDAR queda inactivo
+  (igual que el CLI de cámara plano).
+
+Ambos modos alimentan el mismo PoseStreamSession que usa `python main.py stream`.
 
 Requiere numpy<2 en el entorno del nodo -- cv_bridge (empaquetado con ROS2
 Jazzy) está compilado contra numpy 1.x; con numpy>=2 (lo que trae este
@@ -23,12 +31,12 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from ultralytics import YOLO
 from vision_msgs.msg import Detection2DArray
 
-from ..config import POSE_YOLO_WEIGHTS, VIDEO_VLM_CHUNK_SEC, VLM_ID, VLM_WARMUP
-from ..detection import resolve_device, warmup_yolo
+from ..config import POSE_YOLO_WEIGHTS, VIDEO_VLM_CHUNK_SEC, VLM_ID, VLM_WARMUP, YOLO_WEIGHTS
+from ..detection import assign_spatial_ids, detect_people, resolve_device, track_detections, warmup_yolo
 from ..pose import gait as pose_gait
 from ..runners.pose_session import PoseStreamSession
 from ..vlm.inference import warmup_vlm
@@ -52,6 +60,7 @@ class VlmHriNode(Node):
 
         self.declare_parameter("image_topic", "/head_front_camera/color/image_raw")
         self.declare_parameter("detections_topic", "/detections/tracked")
+        self.declare_parameter("use_dynamic_tracking", True)
         self.declare_parameter("image_qos_reliability", "best_effort")
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("chunk_sec", float(VIDEO_VLM_CHUNK_SEC))
@@ -66,6 +75,12 @@ class VlmHriNode(Node):
         self.declare_parameter("chunk_dir", str(Path.home() / ".ros" / "vlm_hri_chunks"))
 
         image_topic = str(self.get_parameter("image_topic").value)
+        # Convención ROS image_transport: el tópico "…/compressed" publica
+        # sensor_msgs/CompressedImage, no sensor_msgs/Image -- se detecta por
+        # el nombre para no necesitar un parámetro aparte que el usuario
+        # tenga que recordar poner en sincronía con el tópico.
+        self._image_compressed = image_topic.rstrip("/").endswith("/compressed")
+        self._use_dynamic_tracking = bool(self.get_parameter("use_dynamic_tracking").value)
         detections_topic = str(self.get_parameter("detections_topic").value)
         image_qos_str = str(self.get_parameter("image_qos_reliability").value)
         self._frame_id = str(self.get_parameter("frame_id").value)
@@ -78,6 +93,11 @@ class VlmHriNode(Node):
 
         self._bridge = CvBridge()
         self._device = resolve_device()
+        self._yolo: YOLO | None = None
+        self._prev_dets: list[dict] = []
+        if not self._use_dynamic_tracking:
+            self.get_logger().info("Cargando YOLO (detección+tracking propios, sin dynamic_tracking) …")
+            self._yolo = YOLO(YOLO_WEIGHTS)
         self._yolo_pose: YOLO | None = None
         if self._use_pose:
             self.get_logger().info("Cargando YOLO-pose …")
@@ -91,19 +111,32 @@ class VlmHriNode(Node):
         self._session: PoseStreamSession | None = None
         self._session_lock = threading.Lock()
 
-        image_sub = Subscriber(self, Image, image_topic, qos_profile=_sensor_qos(image_qos_str))
-        det_sub = Subscriber(self, Detection2DArray, detections_topic, qos_profile=10)
-        self._sync = ApproximateTimeSynchronizer(
-            [image_sub, det_sub], queue_size=16, slop=slop
-        )
-        self._sync.registerCallback(self._on_synced)
-        self.get_logger().info(f"Suscrito a {image_topic} + {detections_topic} (slop={slop}s)")
+        image_msg_type = CompressedImage if self._image_compressed else Image
+        kind = "CompressedImage" if self._image_compressed else "Image"
+        if self._use_dynamic_tracking:
+            image_sub = Subscriber(self, image_msg_type, image_topic, qos_profile=_sensor_qos(image_qos_str))
+            det_sub = Subscriber(self, Detection2DArray, detections_topic, qos_profile=10)
+            self._sync = ApproximateTimeSynchronizer(
+                [image_sub, det_sub], queue_size=16, slop=slop
+            )
+            self._sync.registerCallback(self._on_synced)
+            self.get_logger().info(f"Suscrito a {image_topic} ({kind}) + {detections_topic} (slop={slop}s)")
+        else:
+            self.create_subscription(
+                image_msg_type, image_topic, self._on_image_only, _sensor_qos(image_qos_str)
+            )
+            self.get_logger().info(
+                f"Suscrito a {image_topic} ({kind}) -- detección/tracking propios, sin dynamic_tracking "
+                "(sin posición LiDAR: clustering/proximidad ENGAGED inactivos)"
+            )
 
     def _ensure_session(self, w: int, h: int) -> PoseStreamSession:
         if self._session is not None:
             return self._session
         with self._session_lock:
             if self._session is None:
+                if self._yolo is not None:
+                    warmup_yolo(self._yolo, shape=(h, w, 3))
                 if self._yolo_pose is not None:
                     warmup_yolo(self._yolo_pose, shape=(h, w, 3))
                 sink = RosPublisherSink(self, frame_id=self._frame_id)
@@ -116,12 +149,37 @@ class VlmHriNode(Node):
                 self.get_logger().info(f"Sesión iniciada ({w}x{h} @ {self._assumed_fps} fps asumidos)")
         return self._session
 
-    def _on_synced(self, image_msg: Image, det_msg: Detection2DArray) -> None:
-        frame = self._bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
+    def _decode_image(self, image_msg: Image | CompressedImage):
+        if self._image_compressed:
+            return self._bridge.compressed_imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
+        return self._bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
+
+    def _on_synced(self, image_msg: Image | CompressedImage, det_msg: Detection2DArray) -> None:
+        frame = self._decode_image(image_msg)
         h, w = frame.shape[:2]
         session = self._ensure_session(w, h)
 
         dets, _world_xy = detection2d_array_to_dets(det_msg)
+        if self._use_pose and self._yolo_pose is not None:
+            pose_raw = pose_gait.detect_people_pose(self._yolo_pose, frame)
+            pose_gait.attach_pose_keypoints(dets, pose_raw)
+
+        session.append_frame(frame, dets)
+        session.tick()
+
+    def _on_image_only(self, image_msg: Image | CompressedImage) -> None:
+        """Sin dynamic_tracking: detección+tracking propios (mismo criterio
+        que `main.py stream --camera`), sin posición real -- world_x/world_y
+        quedan ausentes en cada det, así que _collect_world_xy en
+        pose_session.py no aporta nada y el chequeo de proximidad LiDAR
+        queda en no-op automáticamente (igual que en el CLI plano)."""
+        frame = self._decode_image(image_msg)
+        h, w = frame.shape[:2]
+        session = self._ensure_session(w, h)
+
+        raw = detect_people(self._yolo, frame)
+        dets = track_detections(self._prev_dets, raw) if self._prev_dets else assign_spatial_ids(raw)
+        self._prev_dets = dets
         if self._use_pose and self._yolo_pose is not None:
             pose_raw = pose_gait.detect_people_pose(self._yolo_pose, frame)
             pose_gait.attach_pose_keypoints(dets, pose_raw)

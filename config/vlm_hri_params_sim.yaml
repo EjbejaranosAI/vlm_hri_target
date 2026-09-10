@@ -11,6 +11,7 @@ vlm_hri_node:
   ros__parameters:
     image_topic: "/head_front_camera/color/image_raw"
     detections_topic: "/detections/tracked"
+    use_dynamic_tracking: true  # false = solo cámara, detección/tracking propios (sin LiDAR)
     image_qos_reliability: "best_effort"
     frame_id: "map"
     chunk_sec: 1.0

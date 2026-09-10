@@ -105,14 +105,28 @@ Los resultados quedan en `output/<nombre_del_video_o_camera_N>/`:
 
 ## ROS2 (TIAGO / Gazebo)
 
-`vlm_hri_node` sustituye la cámara/detección/tracking propios por los de
-[`dynamic-tracking`](../dynamic-tracking) (LiDAR 360° + YOLO auxiliar, ya con
-tracking Kalman + ID estable + posición real en el mundo): se suscribe a la
-imagen cruda del robot y a `/detections/tracked`
-(`vision_msgs/Detection2DArray` — bbox, track_id embebido en `class_id` como
-`"person#7"`, y posición real vía `results[0].pose`), corre localmente solo
-el modelo de pose (para marcha/gait — dynamic_tracking no hace pose), y
-alimenta la misma sesión de streaming que usa `python main.py stream`.
+`vlm_hri_node` tiene dos modos de entrada, elegidos con `use_dynamic_tracking`:
+
+- **`use_dynamic_tracking:=true` (default)** — sustituye la cámara/detección/
+  tracking propios por los de [`dynamic-tracking`](../dynamic-tracking)
+  (LiDAR 360° + YOLO auxiliar, ya con tracking Kalman + ID estable + posición
+  real en el mundo): se suscribe a la imagen cruda del robot y a
+  `/detections/tracked` (`vision_msgs/Detection2DArray` — bbox, track_id
+  embebido en `class_id` como `"person#7"`, y posición real vía
+  `results[0].pose`), y corre localmente solo el modelo de pose (para
+  marcha/gait — dynamic_tracking no hace pose). Habilita clustering/
+  proximidad LiDAR para corroborar ENGAGED.
+- **`use_dynamic_tracking:=false`** — solo cámara, sin `dynamic_tracking`: se
+  suscribe únicamente a `image_topic` y hace su propia detección+tracking de
+  personas (mismo criterio que `main.py stream --camera`). Sin posición real,
+  el clustering/proximidad LiDAR queda inactivo (igual que el CLI de cámara
+  plano) — `detections_topic` se ignora en este modo.
+
+`image_topic` acepta tanto `sensor_msgs/Image` como, si el nombre termina en
+`/compressed` (convención `image_transport`), `sensor_msgs/CompressedImage`
+— se detecta solo por el sufijo del tópico, sin parámetro aparte.
+
+Ambos modos alimentan la misma sesión de streaming que usa `python main.py stream`.
 
 **Requiere un entorno con `numpy<2`.** `cv_bridge` (parte de ROS2) está
 compilado contra NumPy 1.x; el `.venv` de este repo usa NumPy 2.x para
@@ -145,13 +159,18 @@ dentro del venv activado es lo que hace que el script `vlm_hri_node`
 generado tenga el shebang del venv (con torch/ultralytics/transformers)
 en vez del Python del sistema.
 
-Probado end-to-end en esta máquina (sin TIAGO/Gazebo real, con
-`Image`+`Detection2DArray` sintéticos publicados a mano): el nodo carga
-YOLO-pose + VLM, sincroniza ambos tópicos, corre el mismo pipeline de
-refinamiento que el CLI (~0.7s/trozo, en línea con los tiempos de
-`main.py videos`) y publica correctamente en los 3 tópicos de salida,
-incluida la posición LiDAR (`map_x`/`map_y`) y el `cluster_id`. Falta la
-validación contra la cámara/LiDAR reales del TIAGO o Gazebo.
+Probado end-to-end en esta máquina (sin TIAGO/Gazebo real, con mensajes
+sintéticos publicados a mano) en los dos modos:
+- `use_dynamic_tracking:=true` con `Image`+`Detection2DArray` sintéticos: el
+  nodo carga YOLO-pose + VLM, sincroniza ambos tópicos, corre el mismo
+  pipeline de refinamiento que el CLI (~0.7s/trozo, en línea con los tiempos
+  de `main.py videos`) y publica correctamente en los 3 tópicos de salida,
+  incluida la posición LiDAR (`map_x`/`map_y`) y el `cluster_id`.
+- `use_dynamic_tracking:=false` con solo `Image`: el nodo carga su propio
+  YOLO de detección+tracking además del de pose, y procesa los trozos sin
+  necesitar ningún tópico de detecciones externo.
+
+Falta la validación contra la cámara/LiDAR reales del TIAGO o Gazebo.
 
 Tópicos publicados (`config/vlm_hri_params_{sim,robot}.yaml` fija
 `frame_id: map` en sim / `odom` en robot, igual que `tracking_frame` en
