@@ -170,7 +170,49 @@ sintéticos publicados a mano) en los dos modos:
   YOLO de detección+tracking además del de pose, y procesa los trozos sin
   necesitar ningún tópico de detecciones externo.
 
-Falta la validación contra la cámara/LiDAR reales del TIAGO o Gazebo.
+### Correr en TIAGO Pro (probado con cámara real)
+
+Cuando la cámara del robot solo publica el transporte comprimido (típico por
+ancho de banda), sin `dynamic_tracking` corriendo todavía:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+
+ros2 launch vlm_hri_target vlm_hri.launch.py profile:=robot \
+  use_dynamic_tracking:=false \
+  image_topic:=/head_front_camera/color/image_raw/compressed
+```
+
+(`image_topic` que termina en `/compressed` se suscribe automáticamente como
+`sensor_msgs/CompressedImage`, sin parámetro aparte). Para ver el video
+anotado en vivo:
+
+```bash
+ros2 run rqt_image_view rqt_image_view /vlm_hri/image_annotated
+```
+
+Dos cosas que importan para que salga estable y fluido, verificadas en
+robot real:
+
+- **Cargador conectado.** En batería, el driver de NVIDIA le recorta el
+  límite de potencia a la GPU a la mitad (p. ej. 40W en vez de 80W en una
+  RTX 4060 Laptop) — bajo ese techo la GPU no sostiene el reloj alto durante
+  la inferencia del VLM y aparecen picos de latencia de varios segundos,
+  inconsistentes. Comprobar con `nvidia-smi -q -d POWER` (`Current Power
+  Limit` debería ser el `Default Power Limit`, no la mitad).
+- **`/vlm_hri/image_annotated` se publica frame a frame**, no en ráfaga por
+  trozo del VLM — cada frame que llega se dibuja de inmediato con la
+  última acción/estado ya conocidos (ver `PoseStreamSession.render_current`
+  en `runners/pose_session.py`), así que el video se ve fluido a la
+  velocidad real de la cámara aunque la etiqueta de texto solo se actualice
+  una vez por trozo (~1s). Si ves el video a saltos (ráfagas separadas por
+  huecos de >1s en `ros2 topic hz /vlm_hri/image_annotated`), revisa que
+  estás en una versión del repo que ya tiene este fix.
+
+Falta la validación contra el LiDAR real del TIAGO (probado con
+`use_dynamic_tracking:=false`, sin `dynamic_tracking` corriendo a la vez
+todavía) y contra Gazebo.
 
 Tópicos publicados (`config/vlm_hri_params_{sim,robot}.yaml` fija
 `frame_id: map` en sim / `odom` en robot, igual que `tracking_frame` en
