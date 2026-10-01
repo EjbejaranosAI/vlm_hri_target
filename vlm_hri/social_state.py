@@ -28,6 +28,7 @@ SOCIAL_UNKNOWN = "UNKNOWN"
 _ACTION_TO_SOCIAL: dict[str, str] = {
     "standing": SOCIAL_AVAILABLE,
     "sitting": SOCIAL_AVAILABLE,
+    "lying": SOCIAL_AVAILABLE,
     "idle": SOCIAL_AVAILABLE,
     "looking": SOCIAL_ATTENTIVE,
     "greeting": SOCIAL_ATTENTIVE,
@@ -94,9 +95,11 @@ def use_vlm_social_states() -> bool:
 # abstracto (nunca una actividad concreta observable) -- _SOCIAL_ALIASES
 # completo NO sirve aquí: incluye "phone"/"reading"/"conversation", que SÍ
 # son acciones válidas y específicas (justo lo que se le pide al VLM en 'a'),
-# no vocabulario social colado por error.
+# no vocabulario social colado por error. "idle" tampoco va aquí: el prompt
+# lo permite como acción (medido: el VLM respondía "a": "idle" y se borraba
+# a "unknown"); como intención sigue mapeando a AVAILABLE vía _SOCIAL_ALIASES.
 _PURE_SOCIAL_ALIASES = {
-    "available", "free", "idle", "interruptible",
+    "available", "free", "interruptible",
     "attentive", "aware", "receptive",
     "busy", "occupied",
     "engaged",
@@ -141,18 +144,18 @@ def action_to_social_state(action: str) -> str:
     tr = _action_traits(low)
     if tr["walking"] or tr["running"]:
         return SOCIAL_MOVING
-    if tr["talking"]:
+    if tr["talking"] or tr["env_interaction"]:
         return SOCIAL_ENGAGED
-    if tr["phone"]:
+    if tr["phone"] or tr["solo_task"]:
         return SOCIAL_BUSY
+    if tr["light_secondary"]:
+        return SOCIAL_AVAILABLE
     if tr["smiling"]:
         return SOCIAL_ATTENTIVE
     if tr["sitting"] and not tr["standing"]:
         return SOCIAL_AVAILABLE
     if tr["standing"]:
         return SOCIAL_AVAILABLE
-    if any(k in low for k in ("read", "work", "laptop", "book")):
-        return SOCIAL_BUSY
     if any(k in low for k in ("greet", "wave", "look", "watch", "eye")):
         return SOCIAL_ATTENTIVE
     return SOCIAL_UNKNOWN
@@ -169,14 +172,25 @@ def reconcile_social_with_action(action: str, social: str) -> str:
         # ENGAGED gana sobre MOVING si el VLM ya juzgó (en su campo 's',
         # independiente del texto de 'a') que hay una interacción real en
         # curso — caminar mientras se conversa/saluda a alguien es
-        # interacción, no solo tránsito.
+        # interacción, no solo tránsito. Sin esa corroboración previa,
+        # "walking and talking" es MOVING (transito), no ENGAGED -- por eso
+        # este chequeo va ANTES que el de talking/env_interaction de abajo.
         if social == SOCIAL_ENGAGED:
             return SOCIAL_ENGAGED
         return SOCIAL_MOVING
-    if tr["talking"]:
+    if tr["talking"] or tr["env_interaction"]:
         return SOCIAL_ENGAGED
-    if tr["phone"]:
+    if tr["phone"] or tr["solo_task"]:
         return SOCIAL_BUSY
+    if tr["light_secondary"]:
+        # Actividad secundaria ligera (comer/beber/rezar) es interrumpible
+        # por definicion -- BUSY se corrige a AVAILABLE (el VLM lo dio mal:
+        # esto no es una tarea absorbente). Pero un ENGAGED/ATTENTIVE/BUSY ya
+        # dado con mas contexto no se pisa (igual que sitting/standing de
+        # abajo) -- comer mientras se habla con alguien sigue siendo ENGAGED.
+        if social in (SOCIAL_ENGAGED, SOCIAL_ATTENTIVE):
+            return social
+        return SOCIAL_AVAILABLE
     if tr["smiling"]:
         return SOCIAL_ATTENTIVE
     if tr["sitting"] and not tr["standing"]:
@@ -249,6 +263,30 @@ def normalize_social_state(text: str) -> str:
         if word in _SOCIAL_ALIASES:
             return _SOCIAL_ALIASES[word]
     return SOCIAL_UNKNOWN
+
+
+def _normalize_score_0_2(text) -> int | None:
+    """Entero 0-2 (confidence/interrupt_cost del VLM, ver prompt_templates/)
+    o None si no se pudo parsear -- None se distingue a propósito de un 0
+    real del VLM (falta el campo vs. "es trivial de interrumpir")."""
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    try:
+        v = int(round(float(s)))
+    except ValueError:
+        return None
+    return max(0, min(2, v))
+
+
+def normalize_confidence(text) -> int | None:
+    return _normalize_score_0_2(text)
+
+
+def normalize_interrupt_cost(text) -> int | None:
+    return _normalize_score_0_2(text)
 
 
 def _never_unknown(state: str) -> str:

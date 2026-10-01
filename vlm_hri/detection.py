@@ -90,18 +90,23 @@ def track_detections(prev: list[dict], curr: list[dict], iou_thresh: float = TRA
             row["pid"] = best_p["pid"]
             used.add(best_p["pid"])
         out.append(row)
-    next_id = max((p["pid"] for p in prev), default=0) + 1
+    # Persona nueva -> el menor ID libre (ni en este frame ni en el anterior,
+    # para no heredar el de alguien que acaba de salir). Antes se usaba
+    # max(prev)+1 sin reciclar y, pasado MAX_TRACK_IDS, el ID de la persona
+    # MÁS CERCANA aunque siguiera en el frame: medido en esperando.mp4 (cola
+    # de ~15 personas), 83% de los frames tenían IDs duplicados -- el VLM veía
+    # tres cajas "ID1" y la marcha mezclaba rodillas de varias personas.
+    # Si no queda ninguno <= MAX_TRACK_IDS se pasa del tope: nunca duplicar.
+    taken = used | {p["pid"] for p in prev}
+    next_id = 1
     for row in out:
         if "pid" not in row:
-            if next_id <= MAX_TRACK_IDS:
-                row["pid"] = next_id
+            while next_id in taken:
                 next_id += 1
-            elif prev:
-                nearest = min(prev, key=lambda p: _center_distance(row, p))
-                row["pid"] = nearest["pid"]
-            else:
-                row["pid"] = 1
+            row["pid"] = next_id
+            taken.add(next_id)
     return sorted(out, key=lambda d: d["pid"])
+
 
 
 def stable_person_ids(

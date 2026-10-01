@@ -26,6 +26,7 @@ def _is_sitting_phrase(low: str) -> bool:
 
 
 def _action_traits(low: str) -> dict[str, bool]:
+    phone = bool(re.search(r"\bphone\b", low) or re.search(r"\bmobile\b", low))
     return {
         "sitting": _is_sitting_phrase(low),
         "standing": bool(
@@ -38,13 +39,56 @@ def _action_traits(low: str) -> dict[str, bool]:
             or re.search(r"\bwalk(?:ing|s|ed)?\b", low)
         ),
         "running": bool(re.search(r"\brunning\b", low) or re.search(r"\bjogg", low)),
+        # "talking ON THE PHONE" no es conversación cara a cara (ENGAGED) --
+        # es una llamada, tarea solitaria (BUSY, ver trait "phone"). Excluir
+        # el caso "phone" de este trait evita que "talking on phone" entre
+        # por la rama ENGAGED (que exige corroboración de otra persona
+        # ENGAGED cerca por LiDAR) y acabe cayendo hasta AVAILABLE cuando esa
+        # corroboración nunca puede existir para una llamada.
         "talking": bool(
-            re.search(r"\btalk", low)
-            or re.search(r"\bspeak", low)
-            or re.search(r"\bconvers", low)
+            not phone
+            and (
+                re.search(r"\btalk", low)
+                or re.search(r"\bspeak", low)
+                or re.search(r"\bconvers", low)
+            )
         ),
         "smiling": bool(re.search(r"\bsmil", low)),
-        "phone": bool(re.search(r"\bphone\b", low) or re.search(r"\bmobile\b", low)),
+        "phone": phone,
+        # Actividad secundaria ligera, interrumpible (AVAILABLE) -- distinta
+        # de "phone"/"read"/"work" (BUSY, tarea absorbente que es de mala
+        # educación interrumpir).
+        "light_secondary": bool(
+            re.search(r"\beat", low)
+            or re.search(r"\bdrink", low)
+            or re.search(r"\bpray", low)
+        ),
+        # Tarea solitaria absorbente (BUSY) más allá de "phone" -- antes solo
+        # cubría read/work/laptop/book/writ/typ (duplicado en social_state.py
+        # en dos sitios); se unifica aquí y se amplía con think/study/focus/
+        # computer/screen, que el VLM ya puede describir con el vocabulario
+        # nuevo del prompt pero que antes de esto no disparaban BUSY -- caían
+        # al branch genérico de sitting/standing y se quedaban en AVAILABLE.
+        "solo_task": bool(
+            re.search(r"\bread", low)
+            or re.search(r"\bwork", low)
+            or re.search(r"\blaptop\b", low)
+            or re.search(r"\bbook\b", low)
+            or re.search(r"\bwrit", low)
+            or re.search(r"\btyp", low)
+            or re.search(r"\bthink", low)
+            or re.search(r"\bstud", low)
+            or re.search(r"\bfocus", low)
+            or re.search(r"\bconcentrat", low)
+            or re.search(r"\bcomputer\b", low)
+            or re.search(r"\bscreen\b", low)
+        ),
+        # Interaccion con el entorno (no con otra persona) -- ENGAGED.
+        "env_interaction": bool(
+            re.search(r"\bphoto", low)
+            or re.search(r"\bpictur", low)
+            or re.search(r"\bfilm", low)
+        ),
     }
 
 

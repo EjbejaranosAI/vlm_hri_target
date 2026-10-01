@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 from ..actions import _action_traits, normalize_action
-from ..config import YOLO_CONF, YOLO_IOU, YOLO_MAX_DET, YOLO_POST_NMS_IOU
+from ..config import YOLO_CONF, YOLO_IOU, YOLO_MAX_DET, YOLO_POST_NMS_IOU, vlm_motion_hint
 from ..detection import box_iou, nms_boxes, sort_dets_left_right
 from ..drawing import pid_label, ui_scale
 from ..motion import chunk_motion_by_pid, refine_chunk_labels
@@ -42,7 +42,10 @@ from ..vlm.prompts import MOTION_COLOR_HINT, vlm_prompt
 # más grande) — quien está lejos importa menos para elegir con quién
 # interactuar. Parámetro (no una constante quemada) para poder ampliarlo el
 # día que se necesite atender a más gente a la vez.
-MAX_VLM_PEOPLE = int(os.environ.get("MAX_VLM_PEOPLE", "10"))
+# Default 5: medido con Qwen2-VL-2B en videos con 4-12 personas por trozo,
+# el JSON salía roto (objetos sin su ID, "a" copiando el prompt, la misma
+# etiqueta para todos) en 24/25 trozos.
+MAX_VLM_PEOPLE = int(os.environ.get("MAX_VLM_PEOPLE", "5"))
 
 
 def closest_n_pids(frame_rows: list[dict], pids: list[int], n: int) -> list[int]:
@@ -82,22 +85,30 @@ SKELETON = [
     (L_EAR, L_SHOULDER), (R_EAR, R_SHOULDER),
 ]
 
-# Calibrado con datos reales (control negativo
-# (gente de pie confirmada) vs. caminata lateral confirmada → 5°/2 cruces da
-# 74% de recall real con ~7% de falsos positivos (12°/2 daba solo 25% recall).
-# Configurables por si un video concreto necesita más rigor que el default
-# calibrado (subir cualquiera de los dos baja falsos positivos a costa de
-# recall — ver MotionHysteresis para el otro control de rigor: confirmación
-# por varios trozos antes de creer la evidencia cruda de este frame).
-MIN_AMPLITUDE_DEG = float(os.environ.get("GAIT_MIN_AMPLITUDE_DEG", "5.0"))
-MIN_CROSSINGS_PER_CHUNK = int(os.environ.get("GAIT_MIN_CROSSINGS", "2"))
+# Recalibrado 2026-10-02 con los 5 videos de input_videos/ (series de
+# rodilla L-R por persona y trozo de 1s, etiquetadas a ojo): el criterio
+# anterior (amplitud max-min >= 5° y >= 2 cruces de la MEDIA) daba falso
+# positivo en 96/124 muestras de gente quieta (77%) -- un solo frame con un
+# keypoint mal enganchado ya da 5° de max-min, y un ruido de +-1-2° alrededor
+# de la media da 5-11 "cruces". Ahora: mediana de 3 frames (quita picos de un
+# frame), amplitud robusta p90-p10 y cruces con banda muerta (Schmitt: solo
+# cuenta pasar de mediana-banda a mediana+banda o al revés). Con 12°/4°/1
+# cruce: 13/121 falsos positivos (11%) y conserva el positivo que se detectaba.
+# Ojo: casi no hay caminata lateral con piernas visibles en esos videos
+# (el recall NO está bien medido: falta un video con caminata lateral).
+# Un paso dura ~0.5s, así que en un trozo de 1s la diferencia L-R cambia de
+# lado ~1-2 veces: exigir 1 cruce limpio basta.
+MIN_AMPLITUDE_DEG = float(os.environ.get("GAIT_MIN_AMPLITUDE_DEG", "12.0"))
+GAIT_BAND_DEG = float(os.environ.get("GAIT_BAND_DEG", "4.0"))
+MIN_CROSSINGS_PER_CHUNK = int(os.environ.get("GAIT_MIN_CROSSINGS", "1"))
 # Muestras válidas (ambas rodillas visibles) mínimas en el trozo para evaluar
 # la marcha — menos que esto es ruido, no una serie con la que medir
 # amplitud/cruces de forma confiable.
-MIN_GAIT_SAMPLES = int(os.environ.get("GAIT_MIN_SAMPLES", "4"))
+MIN_GAIT_SAMPLES = int(os.environ.get("GAIT_MIN_SAMPLES", "6"))
 
 COLOR_MOVING_BGR = (255, 0, 0)  # azul
 COLOR_STANDING_BGR = (0, 0, 255)  # rojo
+COLOR_NEUTRAL_BGR = (0, 255, 255)  # amarillo: VLM_MOTION_HINT=0 (sin pista)
 THIN_LINE_PX = 1
 
 
@@ -229,6 +240,103 @@ def _knee_angle(kpts: np.ndarray, hip_i: int, knee_i: int, ankle_i: int) -> floa
     return float(np.degrees(np.arccos(cos_a)))
 
 
+# —— Postura sentado/de pie por geometría real de pose ————————————————
+# Antes la postura salía de heurísticas de caja (aspecto ancho/alto de la
+# bbox, silueta) o directamente de lo que describiera el VLM -- ambas menos
+# fiables que el ángulo real cadera-rodilla-tobillo que ya se calcula para la
+# marcha (_knee_angle): pierna casi recta (~160-180°) es de pie, pierna
+# claramente doblada (~<=130°) es sentado. Deja una zona muerta 130-155° sin
+# decidir (rodilla parcialmente flexionada -- agachándose, subiendo un
+# escalón, etc. -- no es ni una cosa ni la otra con confianza).
+POSTURE_STANDING_MIN_DEG = float(os.environ.get("POSTURE_STANDING_MIN_DEG", "155.0"))
+POSTURE_SITTING_MAX_DEG = float(os.environ.get("POSTURE_SITTING_MAX_DEG", "130.0"))
+POSTURE_MIN_SEEN = int(os.environ.get("POSTURE_MIN_SEEN", "3"))
+# "lying": el cuerpo (nariz -> punto medio cadera -> punto medio tobillo) es
+# más ANCHO que ALTO en la imagen -- persona caída/tumbada en vez de de pie o
+# sentada. Se comprueba ANTES que el ángulo de rodilla (que asume postura
+# vertical y podría leer "sentado" en una pierna doblada tumbado de lado).
+# Umbral en proporción, no en píxeles absolutos, para no depender de lo lejos
+# que esté la persona de la cámara.
+LYING_WIDTH_HEIGHT_RATIO = float(os.environ.get("LYING_WIDTH_HEIGHT_RATIO", "1.2"))
+
+
+def _midpoint(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
+    ok_a, ok_b = a[2] >= KPT_CONF_MIN, b[2] >= KPT_CONF_MIN
+    if ok_a and ok_b:
+        return (a[:2] + b[:2]) / 2.0
+    if ok_a:
+        return a[:2]
+    if ok_b:
+        return b[:2]
+    return None
+
+
+def _is_lying(kpts: np.ndarray) -> bool:
+    nose = kpts[NOSE]
+    hip_mid = _midpoint(kpts[L_HIP], kpts[R_HIP])
+    ankle_mid = _midpoint(kpts[L_ANKLE], kpts[R_ANKLE])
+    if nose[2] < KPT_CONF_MIN or hip_mid is None or ankle_mid is None:
+        return False
+    dx = abs(ankle_mid[0] - nose[0])
+    dy = abs(ankle_mid[1] - nose[1]) + 1e-6
+    # También exige cadera-tobillo con recorrido horizontal real (no solo
+    # cabeza-tobillo) para no confundir a alguien de pie inclinado hacia la
+    # cámara (torso más "ancho" en perspectiva) con alguien tumbado.
+    hip_ankle_dx = abs(ankle_mid[0] - hip_mid[0])
+    hip_ankle_dy = abs(ankle_mid[1] - hip_mid[1]) + 1e-6
+    return (dx / dy >= LYING_WIDTH_HEIGHT_RATIO) and (hip_ankle_dx / hip_ankle_dy >= LYING_WIDTH_HEIGHT_RATIO)
+
+
+def classify_posture_from_kpts(kpts: np.ndarray) -> str | None:
+    """'lying'/'sitting'/'standing' por geometría real de pose, o None si no
+    hay confianza suficiente para decidir en ningún sentido (zona muerta del
+    ángulo de rodilla, o keypoints clave sin visibilidad)."""
+    if _is_lying(kpts):
+        return "lying"
+    angles = [
+        a
+        for hip_i, knee_i, ankle_i in ((L_HIP, L_KNEE, L_ANKLE), (R_HIP, R_KNEE, R_ANKLE))
+        if (a := _knee_angle(kpts, hip_i, knee_i, ankle_i)) is not None
+    ]
+    if not angles:
+        return None
+    avg = sum(angles) / len(angles)
+    if avg >= POSTURE_STANDING_MIN_DEG:
+        return "standing"
+    if avg <= POSTURE_SITTING_MAX_DEG:
+        return "sitting"
+    return None
+
+
+def chunk_posture_by_pid(
+    buffer_dets: list[list[dict]], person_ids: list[int]
+) -> dict[int, str]:
+    """'lying'/'sitting'/'standing' por mayoría de frames del trozo (geometría
+    real de pose) -- ausente del dict si no hay suficientes frames con
+    keypoints visibles y confianza para decidir. Se usa como fuente
+    AUTORITATIVA de postura (ver enrich_action_posture): más fiable que la
+    lectura visual del VLM o que las heurísticas de forma de caja, porque
+    mide geometría real de las articulaciones en vez de aproximarla. (No
+    incluye "walking" -- ver refine_labels_pose, que ya tiene su propia
+    detección de marcha real más elaborada y la combina aparte.)"""
+    out: dict[int, str] = {}
+    for pid in person_ids:
+        votes = {"lying": 0, "sitting": 0, "standing": 0}
+        seen = 0
+        for row in buffer_dets:
+            for d in row:
+                if d.get("pid") == pid and "kpts" in d:
+                    seen += 1
+                    posture = classify_posture_from_kpts(d["kpts"])
+                    if posture is not None:
+                        votes[posture] += 1
+                    break
+        if seen < POSTURE_MIN_SEEN or sum(votes.values()) == 0:
+            continue
+        out[pid] = max(votes, key=votes.get)
+    return out
+
+
 def compensate_camera_motion(buffer_dets: list[list[dict]]) -> list[list[dict]]:
     """Copia de `buffer_dets` con el desplazamiento COMÚN a todas las personas
     (la mediana, no el promedio, para que 1-2 personas caminando de verdad no
@@ -271,6 +379,23 @@ def compensate_camera_motion(buffer_dets: list[list[dict]]) -> list[list[dict]]:
     return out
 
 
+def _gait_amplitude_crossings(diffs: list[float]) -> tuple[float, int]:
+    """(amplitud robusta p90-p10, cruces con banda muerta) de la serie de
+    diferencias de rodilla L-R, tras una mediana de 3 frames."""
+    raw = np.asarray(diffs, dtype=float)
+    arr = np.array([np.median(raw[max(0, i - 1): i + 2]) for i in range(len(raw))])
+    amplitude = float(np.percentile(arr, 90) - np.percentile(arr, 10))
+    mid = float(np.median(arr))
+    side, crossings = 0, 0
+    for x in arr:
+        z = 1 if x > mid + GAIT_BAND_DEG else (-1 if x < mid - GAIT_BAND_DEG else 0)
+        if z and side and z != side:
+            crossings += 1
+        if z:
+            side = z
+    return amplitude, crossings
+
+
 def chunk_gait_by_pid(
     buffer_dets: list[list[dict]], person_ids: list[int]
 ) -> dict[int, bool]:
@@ -294,13 +419,19 @@ def chunk_gait_by_pid(
                 break
         if len(diffs) < MIN_GAIT_SAMPLES:
             continue
-        arr = np.array(diffs)
-        amplitude = float(arr.max() - arr.min())
-        signs = np.sign(arr - arr.mean())
-        crossings = int(np.sum(signs[1:] != signs[:-1]))
+        amplitude, crossings = _gait_amplitude_crossings(diffs)
         if amplitude >= MIN_AMPLITUDE_DEG and crossings >= MIN_CROSSINGS_PER_CHUNK:
             out[pid] = True
+        if _GAIT_DEBUG:
+            print(
+                f"    gait pid={pid} n={len(diffs)} amp={amplitude:.1f} cruces={crossings} "
+                f"-> {'MARCHA' if out.get(pid) else '-'} diffs={[round(x) for x in diffs]}",
+                flush=True,
+            )
     return out
+
+
+_GAIT_DEBUG = os.environ.get("GAIT_DEBUG", "0") == "1"
 
 
 # EXPERIMENTAL — sin calibrar con datos reales (a diferencia de
@@ -577,11 +708,15 @@ class MotionHysteresis:
 
 
 def draw_thin_pose_box(
-    img: np.ndarray, x1, y1, x2, y2, label: str, kpts: np.ndarray | None, *, moving: bool
+    img: np.ndarray, x1, y1, x2, y2, label: str, kpts: np.ndarray | None, *, moving: bool | None
 ) -> None:
     """Caja delgada + ID (sin texto de estado) + esqueleto COCO-17 completo,
-    todo del mismo color: azul si se mueve, rojo si no."""
-    color = COLOR_MOVING_BGR if moving else COLOR_STANDING_BGR
+    todo del mismo color: azul si se mueve, rojo si no, amarillo si
+    `moving` es None (sin pista de movimiento)."""
+    if moving is None:
+        color = COLOR_NEUTRAL_BGR
+    else:
+        color = COLOR_MOVING_BGR if moving else COLOR_STANDING_BGR
     cv2.rectangle(img, (x1, y1), (x2, y2), color, THIN_LINE_PX)
     if kpts is not None:
         for a, b in SKELETON:
@@ -634,6 +769,46 @@ def draw_box_only(img: np.ndarray, x1, y1, x2, y2, pid: int, color: tuple[int, i
     ty = max(th + 4, y1 - 2)
     cv2.rectangle(img, (x1, ty - th - 4), (x1 + tw + 6, ty + baseline), color, -1)
     cv2.putText(img, label, (x1 + 3, ty - 1), font, fs, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def draw_box_details(
+    img: np.ndarray,
+    x1: int, y1: int, x2: int, y2: int,
+    pose_txt: str, action_txt: str, social_txt: str,
+    color: tuple[int, int, int],
+) -> None:
+    """Segunda etiqueta pegada a la caja (bajo ella si hay sitio, si no
+    encima) con postura/acción/intención por separado -- ID + color de caja
+    los da draw_box_only aparte. Antes id/pose/action/intention solo estaban
+    todos juntos en el panel lateral (una lista aparte); esto los pone
+    también encima de cada bbox para verlos sin mirar la lista."""
+    label = f"{pose_txt} | {action_txt} | {social_txt}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.45
+    (tw, th), baseline = cv2.getTextSize(label, font, fs, 1)
+    h_img, w_img = img.shape[:2]
+    ty = y2 + th + 6
+    if ty + baseline > h_img:
+        ty = max(th + 4, y1 - 2)
+    tx = max(0, min(x1, w_img - tw - 6))
+    cv2.rectangle(img, (tx, ty - th - 4), (tx + tw + 6, ty + baseline), color, -1)
+    cv2.putText(img, label, (tx + 3, ty - 1), font, fs, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def draw_target_coords(img: np.ndarray, x1: int, y1: int, world_x: float, world_y: float) -> None:
+    """Etiqueta con la posición real (odom/map, según profile de
+    dynamic_tracking) del target -- para poder leerla directo del
+    video/annotated_image sin ir a /vlm_hri/target_pose. Se dibuja dentro de
+    la caja, justo debajo de la etiqueta de ID (que va arriba, fuera de la
+    caja) -- así no depende de cuánto margen quede debajo de la caja, que
+    puede caer bajo el banner inferior si la persona está pegada al borde."""
+    label = f"({world_x:.2f}, {world_y:.2f})"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.5
+    (tw, th), baseline = cv2.getTextSize(label, font, fs, 1)
+    ty = y1 + th + 6
+    cv2.rectangle(img, (x1, ty - th - 4), (x1 + tw + 6, ty + baseline), (0, 255, 255), -1)
+    cv2.putText(img, label, (x1 + 3, ty - 1), font, fs, (20, 20, 20), 1, cv2.LINE_AA)
 
 
 _PANEL_BG_BGR = (26, 22, 20)
@@ -709,12 +884,14 @@ def annotate_for_vlm_pose(
 ) -> np.ndarray:
     """Frame para el VLM: esqueleto COCO-17 completo + caja delgada, azul (en
     movimiento) / roja (parado), solo con el ID (sin texto de estado) — el
-    color YA es la pista de movimiento."""
+    color YA es la pista de movimiento. Con VLM_MOTION_HINT=0, todas
+    amarillas (sin pista)."""
     out = frame_bgr.copy()
+    hint = vlm_motion_hint()
     for d in sort_dets_left_right(dets):
         draw_thin_pose_box(
             out, d["x1"], d["y1"], d["x2"], d["y2"], pid_label(d["pid"]),
-            d.get("kpts"), moving=d["pid"] in moving_pids,
+            d.get("kpts"), moving=(d["pid"] in moving_pids) if hint else None,
         )
     return out
 
@@ -723,23 +900,38 @@ def vlm_prompt_with_motion_hint(dets: list[dict], *, video: bool = False) -> str
     """Igual que pipeline.vlm_prompt pero añade una nota sobre el color de caja
     (pista de un sensor de movimiento independiente, no del propio VLM)."""
     base = vlm_prompt(dets, video=video)
-    if not dets:
+    if not dets or not vlm_motion_hint():
         return base
     return base + " " + MOTION_COLOR_HINT
 
 
 # —— Mirando a cámara (para ATTENTIVE) ————————————————————————————
-# EXPERIMENTAL, heurística simple sin calibrar: si los dos ojos Y la nariz
-# están visibles con buena confianza, YOLO-pose casi siempre es porque ve la
-# cara de frente (un perfil suele perder la confianza del ojo/oreja lejanos).
-# No distingue "mirando AL ROBOT" de "mirando a otra cámara/punto" — es una
-# aproximación de "cara de frente", no de dirección de mirada real.
-FACE_CONF_MIN = 0.5
+# Vector de orientación de cara 2D, no solo "¿se ven los puntos?": con los
+# dos ojos y la nariz visibles con buena confianza, se mide si la nariz cae
+# centrada entre los ojos (cara de frente) o desplazada hacia un lado (cabeza
+# girada) — normalizado por la distancia entre ojos para que no dependa de lo
+# grande/lejos que esté la persona en el frame. Antes solo se comprobaba que
+# los tres puntos fueran visibles con confianza, sin mirar su geometría: eso
+# confundía una cara en 3/4 de perfil (donde los dos ojos a veces siguen
+# superando el umbral de confianza) con una cara realmente de frente. Sigue
+# sin distinguir "mirando AL ROBOT" de "mirando a otra cosa en esa dirección"
+# — es una aproximación 2D de orientación de cabeza, no mirada 3D real.
+FACE_CONF_MIN = 0.35
+GAZE_MAX_OFFSET_RATIO = 0.30
 
 
 def is_facing_camera(kpts: np.ndarray) -> bool:
     nose, l_eye, r_eye = kpts[NOSE], kpts[L_EYE], kpts[R_EYE]
-    return bool(nose[2] >= FACE_CONF_MIN and l_eye[2] >= FACE_CONF_MIN and r_eye[2] >= FACE_CONF_MIN)
+    if not (
+        nose[2] >= FACE_CONF_MIN and l_eye[2] >= FACE_CONF_MIN and r_eye[2] >= FACE_CONF_MIN
+    ):
+        return False
+    eye_dist = abs(r_eye[0] - l_eye[0])
+    if eye_dist < 1e-3:
+        return False
+    eye_mid_x = (l_eye[0] + r_eye[0]) / 2.0
+    offset_ratio = abs(nose[0] - eye_mid_x) / eye_dist
+    return bool(offset_ratio <= GAZE_MAX_OFFSET_RATIO)
 
 
 FACING_MIN_SEEN = 4
@@ -781,63 +973,140 @@ def chunk_facing_camera_by_pid(
 # —— Selección de a quién puede acercarse el robot ("-Target-") ————————
 # Prioridad: ATTENTIVE (de pie, libre, mirando) > AVAILABLE (de pie, libre) >
 # el resto (ENGAGED/BUSY/MOVING no son buenos candidatos: están ocupados,
-# hablando con alguien más, o en movimiento). Entre empates, el más cercano
-# a la cámara (caja más grande).
+# hablando con alguien más, o en movimiento). Entre empates de prioridad:
+# 1) menor costo de interrupción ('interrupt_cost' 0-2, juicio propio del
+#    VLM sobre qué tan disruptivo sería acercarse ahora mismo — ver
+#    prompt_templates/*.json); sin ese dato, no penaliza a nadie (todos 0).
+# 2) más cercano al robot: distancia real ("dist_to_robot", metros, si viene
+#    de un tracker LiDAR externo — pendiente de que dynamic_tracking la
+#    publique, hoy no existe) o, a falta de eso, área de caja como proxy de
+#    cercanía a la cámara.
 _TARGET_PRIORITY = {SOCIAL_ATTENTIVE: 0, SOCIAL_AVAILABLE: 1}
+
+# N: cuántos chunks de VLM (~1s cada uno) SEGUIDOS con la misma intención
+# elegible debe acumular un pid antes de poder convertirse en target NUEVO —
+# evita perseguir a alguien por una única clasificación aislada del VLM
+# (ruidoso, ver MOTION_COLOR_HINT). No aplica para CONSERVAR el target actual
+# (eso ya lo cubre la "pegajosidad" de TargetStability) ni a
+# pick_interaction_target (sin memoria entre llamadas, no hay dónde contar).
+# Ajustable.
+DEFAULT_MIN_CONFIRM_CHUNKS = 2
+
+
+def _target_distance_proxy(d: dict) -> float:
+    """Menor = más cerca del robot. `dist_to_robot` (metros, real) si viene
+    de un tracker LiDAR externo; si no, -área de caja (solo cámara, sin
+    posición real) como proxy de cercanía."""
+    dist = d.get("dist_to_robot")
+    if dist is not None:
+        return float(dist)
+    return -((d["x2"] - d["x1"]) * (d["y2"] - d["y1"]))
+
+
+def _target_sort_key(
+    pid: int, state: str, d: dict, interrupt_cost: dict[int, int] | None
+) -> tuple[int, int, float, int]:
+    ic = interrupt_cost.get(pid, 2) if interrupt_cost is not None else 0
+    return (_TARGET_PRIORITY[state], ic, _target_distance_proxy(d), pid)
 
 
 def pick_interaction_target(
-    dets: list[dict], social_states: dict[int, str]
+    dets: list[dict],
+    social_states: dict[int, str],
+    interrupt_cost: dict[int, int] | None = None,
 ) -> int | None:
     """pid del mejor candidato para que el robot inicie interacción, o None
-    si nadie en el frame está en un estado apto (todos ENGAGED/BUSY/MOVING)."""
-    candidates = []
-    for d in dets:
-        pid = d["pid"]
-        state = social_states.get(pid)
-        if state not in _TARGET_PRIORITY:
-            continue
-        area = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"])
-        candidates.append((_TARGET_PRIORITY[state], -area, pid))
+    si nadie en el frame está en un estado apto (todos ENGAGED/BUSY/MOVING).
+    Sin memoria entre llamadas -- no aplica el filtro de confirmación por
+    permanencia de N chunks de `TargetStability`, úsala a ella para eso."""
+    candidates = [
+        _target_sort_key(d["pid"], social_states.get(d["pid"]), d, interrupt_cost)
+        for d in dets
+        if social_states.get(d["pid"]) in _TARGET_PRIORITY
+    ]
     if not candidates:
         return None
     candidates.sort()
-    return candidates[0][2]
+    return candidates[0][-1]
 
 
 class TargetStability:
     """Mantiene el mismo target de interacción entre frames en vez de
     recalcularlo desde cero cada vez con pick_interaction_target.
 
-    Sin esto, dos personas casi empatadas (misma prioridad de estado, área de
-    caja parecida) pueden intercambiarse el "-Target-" de un frame a otro por
-    puro jitter de detección — el robot solo puede acercarse a UN target real
-    a la vez, no a uno que cambia constantemente. Se conserva el target
+    Sin esto, dos personas casi empatadas (misma prioridad de estado, misma
+    distancia aprox.) pueden intercambiarse el "-Target-" de un frame a otro
+    por puro jitter de detección — el robot solo puede acercarse a UN target
+    real a la vez, no a uno que cambia constantemente. Se conserva el target
     actual mientras siga siendo elegible (ATTENTIVE/AVAILABLE); solo se
     recalcula cuando deja de serlo (sale de cuadro, pasa a ENGAGED/BUSY/
-    MOVING, etc.)."""
+    MOVING, etc.).
 
-    def __init__(self) -> None:
+    Si `require_confirmation=True`, además exige que un pid lleve
+    `min_confirm_chunks` chunks de VLM SEGUIDOS con la misma intención
+    elegible antes de poder convertirse en target NUEVO (no aplica para
+    conservar el target actual, ver arriba). El llamador debe alimentar esto
+    llamando `record_chunk()` una vez por cada resultado nuevo del VLM — NO
+    por frame renderizado: dentro de un mismo chunk todos los frames
+    comparten la misma clasificación social, así que contar por frame no
+    daría muestras independientes. Por defecto False: un pipeline que nunca
+    llama record_chunk (p. ej. el CLI offline de video.py) seguiría
+    devolviendo None todo el tiempo si esto exigiera confirmación sin que
+    nadie la alimentara."""
+
+    def __init__(
+        self,
+        *,
+        require_confirmation: bool = False,
+        min_confirm_chunks: int = DEFAULT_MIN_CONFIRM_CHUNKS,
+    ) -> None:
         self._current: int | None = None
+        self._require_confirmation = require_confirmation
+        self._min_confirm_chunks = min_confirm_chunks
+        self._confirm: dict[int, tuple[str, int]] = {}  # pid -> (estado, chunks seguidos)
 
-    def update(self, dets: list[dict], social_states: dict[int, str]) -> int | None:
-        candidates = []
-        eligible: set[int] = set()
-        for d in dets:
-            pid = d["pid"]
+    def record_chunk(self, social_states: dict[int, str], seen_pids: set[int]) -> None:
+        """Una muestra independiente por pid -- llamar UNA vez por chunk de
+        VLM (no por frame), con el estado social ya resuelto de ese chunk y
+        el conjunto de pids realmente vistos en él (para resetear a quien
+        salió de cuadro)."""
+        for pid in list(self._confirm):
+            if pid not in seen_pids:
+                del self._confirm[pid]
+        for pid in seen_pids:
             state = social_states.get(pid)
             if state not in _TARGET_PRIORITY:
+                self._confirm.pop(pid, None)
                 continue
-            eligible.add(pid)
-            area = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"])
-            candidates.append((_TARGET_PRIORITY[state], -area, pid))
+            last_state, count = self._confirm.get(pid, (None, 0))
+            self._confirm[pid] = (state, count + 1 if state == last_state else 1)
+
+    def _confirmed(self, pid: int) -> bool:
+        if not self._require_confirmation:
+            return True
+        return self._confirm.get(pid, (None, 0))[1] >= self._min_confirm_chunks
+
+    def update(
+        self,
+        dets: list[dict],
+        social_states: dict[int, str],
+        interrupt_cost: dict[int, int] | None = None,
+    ) -> int | None:
+        eligible = {
+            d["pid"]: d for d in dets if social_states.get(d["pid"]) in _TARGET_PRIORITY
+        }
         if self._current is not None and self._current in eligible:
             return self._current
+        candidates = [
+            _target_sort_key(pid, social_states.get(pid), d, interrupt_cost)
+            for pid, d in eligible.items()
+            if self._confirmed(pid)
+        ]
         if not candidates:
             self._current = None
             return None
         candidates.sort()
-        self._current = candidates[0][2]
+        self._current = candidates[0][-1]
         return self._current
 
 
@@ -851,17 +1120,22 @@ def refine_labels_pose(
     moving_pids_hint: set[int] | None = None,
     world_xy: dict[int, tuple[float, float]] | None = None,
     clusters: dict[int, int] | None = None,
-) -> tuple[dict[int, str], dict[int, str]]:
-    """MOVING/"walking" viene del VLM: se le pasa el clip de varios frames
-    (y, como pista visual aparte, la caja azul/roja de marcha detectada) para
-    que juzgue el movimiento él mismo -- este refinamiento ya NO fuerza
-    "walking" sobre lo que el VLM describió, ni se lo quita, salvo un caso:
-    el sesgo de grupo conocido (el VLM le pega "walking" a TODO el grupo a la
-    vez sin que nadie se haya movido de verdad -- medido: 4/5 personas
-    "walking" con 3-36px de desplazamiento total en 60 frames, nada). Ahí sí
-    se corrige, y solo se exceptúa a quien tiene evidencia cinemática
-    independiente (`confirmed_moving`, usada también en el hint de color del
-    prompt, nunca para reescribir el texto de la acción)."""
+) -> tuple[dict[int, str], dict[int, str], dict[int, str]]:
+    """Devuelve (actions, social, pose) -- `pose` es la postura AUTORITATIVA
+    ("sitting"/"standing"/"walking"/"lying") por pid, ver chunk_posture_by_pid
+    más abajo: 100% pose+matemáticas, el VLM ya no la juzga en absoluto
+    (prompt actualizado: solo describe la actividad específica, o "idle" si
+    no hay ninguna distinguible). `actions` sigue siendo el texto combinado
+    postura+actividad (para el overlay humano, ver enrich_action_posture);
+    quien necesite los campos separados (p. ej. el payload ROS/JSON) usa
+    `pose` tal cual y vlm_hri.motion.strip_posture_prefix(actions[pid]) para
+    la actividad sola.
+
+    "walking" en `pose` viene de evidencia cinemática real (marcha +
+    profundidad + bbox + histéresis + debias de grupo -- el sesgo de grupo
+    conocido, el VLM le pegaba "walking" a TODO el grupo sin que nadie se
+    hubiera movido de verdad: medido, 4/5 personas "walking" con 3-36px de
+    desplazamiento total en 60 frames, nada), nunca del propio VLM."""
     # El respaldo por cinemática de caja de vlm_hri.motion mide posición ABSOLUTA
     # en la imagen — si la cámara se mueve un poco (temblor, paneo), todas las
     # cajas se desplazan igual y parece que todo el mundo camina. Se le pasa
@@ -891,50 +1165,72 @@ def refine_labels_pose(
     actions, social = debias_group_walking(actions, social, person_ids, confirmed_moving)
     actions, social = require_moving_evidence(actions, social, confirmed_moving)
 
-    # Ya NO se fuerza "walking" en el texto de la acción a partir de la señal
-    # cinemática -- el VLM ve el clip completo (varios frames) más la pista
-    # de color, y decide él. moving_pids=set() (no None) apaga también el
-    # respaldo bbox-center de apply_chunk_kinematic_hints (si se dejara en
-    # None, caería a ESE otro forzado en vez de a ninguno). `confirmed_moving`
-    # sigue calculándose arriba solo para debias_group_walking/
-    # require_moving_evidence (corregir sesgo conocido, no para escribir
-    # el texto).
+    # Postura ("sitting"/"standing"/"walking") ya no la juzga el VLM en
+    # absoluto (prompt actualizado: solo describe la actividad específica) --
+    # se construye aquí, 100% de pose+matemáticas: walking de la marcha ya
+    # confirmada (`confirmed_moving`, gait real + profundidad + bbox +
+    # histéresis + debias de grupo), sitting/standing del ángulo real de
+    # rodilla (`chunk_posture_by_pid`) para el resto. `moving_pids=set()` (no
+    # None) sigue apagando el respaldo bbox-center de
+    # apply_chunk_kinematic_hints (ese camino quedó obsoleto: la postura ya
+    # se decide aquí, no en ese otro sitio).
+    posture_hint = chunk_posture_by_pid(compensated, person_ids)
+    # A diferencia de confirmed_moving (usado arriba para debias/evidencia de
+    # texto), aquí SÍ se exige legs_visible -- bbox_confirmed viene de
+    # desplazamiento absoluto de caja (vlm_hri.motion.chunk_motion_by_pid), que
+    # no mira piernas en absoluto: alguien MUY cerca de la cámara (solo
+    # torso/cara en el frame) puede desplazar el centro de su caja lo bastante
+    # con solo inclinarse/balancearse como para pasar ese umbral sin caminar
+    # de verdad. Sin piernas visibles no hay forma de confirmar marcha real,
+    # así que "walking" no se le impone a la postura autoritativa ahí (mismo
+    # criterio que ya se aplicaba a moving_pids_confirmed más arriba).
+    posture_moving = {
+        pid for pid in confirmed_moving if legs_visible.get(pid) is not False
+    }
+    posture_hint.update({pid: "walking" for pid in posture_moving})
     actions, social = refine_chunk_labels(
         actions, social, compensated, person_ids, frame_size,
         moving_pids=set(), legs_visible=legs_visible,
+        posture_hint=posture_hint,
     )
     social = check_engaged_proximity(actions, social, person_ids, world_xy, clusters)
-    return actions, social
+    return actions, social, posture_hint
 
 
 def upgrade_attentive_by_gaze(
     social: dict[int, str], buffer_dets: list[list[dict]], person_ids: list[int]
 ) -> dict[int, str]:
-    """Corrige ATTENTIVE con la mirada real (pose), no el juicio suelto del
-    VLM sobre "orientado a cámara":
-    - AVAILABLE → ATTENTIVE si la pose SÍ confirma que mira de frente la
-      mayoría del trozo.
-    - ATTENTIVE → AVAILABLE si la pose NO lo confirma positivamente — ya sea
-      porque confirma que mira a otro lado, o porque no hay suficientes
-      datos de pose ese trozo para saberlo. Modo rígido (default): ATTENTIVE
-      exige evidencia POSITIVA de mirada, no basta con que el VLM lo diga y
-      nadie lo desmienta (medido: el VLM marca ATTENTIVE con la persona
-      mirando claramente a otro lado, y muchas veces la pose no tiene
-      suficiente confianza para "desmentirlo" con fuerza — sin exigir
-      confirmación positiva, ese ATTENTIVE quedaba sin corregir).
-    No toca ENGAGED/BUSY/MOVING, que ya son más específicos que ATTENTIVE.
-    Desactivable con STRICT_ATTENTIVE_GAZE=0 (vuelve a solo desmentir con
-    evidencia fuerte de NO mirar, dejando sin datos = sin tocar)."""
+    """Ajusta ATTENTIVE con la mirada real (pose, ver is_facing_camera —
+    ahora geométrico: nariz centrada entre ojos, no solo "puntos visibles"),
+    en las dos direcciones:
+    - DEGRADAR: ATTENTIVE → AVAILABLE si la pose NO confirma que mira de
+      frente la mayoría del trozo — ya sea porque confirma que mira a otro
+      lado, o porque no hay suficientes datos de pose ese trozo para saberlo
+      (modo rígido, default: sin datos = no se acepta el ATTENTIVE del VLM).
+    - PROMOCIONAR: AVAILABLE → ATTENTIVE si la pose SÍ confirma mirada
+      centrada la mayoría del trozo. Solo se promueve desde AVAILABLE, nunca
+      desde BUSY/ENGAGED/MOVING (esos ya son un juicio más específico del
+      VLM sobre una actividad concreta que no se debe pisar) — que el estado
+      ya sea AVAILABLE significa que la acción en sí no era "algo crucial"
+      (nada de hablar/teléfono/leer/caminar detectado), así que ahí sí basta
+      con mirada centrada sostenida como evidencia de intención de
+      interactuar. (Antes esta función solo desmentía, nunca promovía, para
+      evitar que cualquiera de pie por casualidad frente al robot contara
+      como ATTENTIVE sin más contexto — la promoción ahora exige que el
+      resto de la escena YA esté en el estado más neutro posible.)
+    Desactivable con STRICT_ATTENTIVE_GAZE=0: en ese modo, sin datos de pose
+    no desmiente un ATTENTIVE existente, pero la promoción SIEMPRE exige
+    evidencia positiva de mirada (eso no es configurable)."""
     facing = chunk_facing_camera_by_pid(buffer_dets, person_ids)
     strict = os.environ.get("STRICT_ATTENTIVE_GAZE", "1") == "1"
     out = dict(social)
     for pid in person_ids:
         cur = out.get(pid)
         is_facing = facing.get(pid)
-        if is_facing is True and cur == SOCIAL_AVAILABLE:
-            out[pid] = SOCIAL_ATTENTIVE
-        elif cur == SOCIAL_ATTENTIVE and (
+        if cur == SOCIAL_ATTENTIVE and (
             is_facing is False or (strict and is_facing is None)
         ):
             out[pid] = SOCIAL_AVAILABLE
+        elif cur == SOCIAL_AVAILABLE and is_facing is True:
+            out[pid] = SOCIAL_ATTENTIVE
     return out

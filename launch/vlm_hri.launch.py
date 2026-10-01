@@ -33,6 +33,10 @@ def _launch_setup(context, *args, **kwargs):
         "use_pose": LaunchConfiguration("use_pose"),
         "draw_pose": LaunchConfiguration("draw_pose"),
     }
+    # Vacío = lo que diga el YAML (no se pisa con un default del launch).
+    target_filter = LaunchConfiguration("target_filter").perform(context).strip()
+    if target_filter:
+        node_params["target_filter"] = target_filter
     node = Node(
         package="vlm_hri_target",
         executable="vlm_hri_node",
@@ -64,8 +68,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "detections_topic",
-                default_value="/detections/tracked",
-                description="Salida de dynamic_tracking (vision_msgs/Detection2DArray, con track_id + posición real). Ignorado si use_dynamic_tracking:=false",
+                default_value="/detections/tracked_fov",
+                description="Salida de dynamic_tracking, solo tracks con bbox de imagen real y fresca (vision_msgs/Detection2DArray, con track_id + posición real). Ignorado si use_dynamic_tracking:=false",
             ),
             DeclareLaunchArgument(
                 "use_dynamic_tracking",
@@ -82,6 +86,11 @@ def generate_launch_description():
                 "draw_pose",
                 default_value="false",
                 description="Dibuja el esqueleto COCO-17 en /vlm_hri/image_annotated",
+            ),
+            DeclareLaunchArgument(
+                "target_filter",
+                default_value="",
+                description="Qué target va a /vlm_hri/target_pose: raw | ema | hyst. Vacío = el del YAML",
             ),
             OpaqueFunction(function=_launch_setup),
         ]

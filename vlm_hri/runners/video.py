@@ -928,7 +928,7 @@ def _run_pose(
         for g, vlm_out in zip(group, results):
             if vlm_out is not None:
                 buffer_dets = all_frame_dets[g["sf"] : g["ef"]]
-                acts, soc = pose_gait.refine_labels_pose(
+                acts, soc, _pose = pose_gait.refine_labels_pose(
                     vlm_out.actions, vlm_out.social_states, buffer_dets, vlm_ids, (w, h),
                     moving_pids_hint=chunk_moving_pids.get(g["ci"]),
                 )

@@ -245,41 +245,75 @@ def infer_posture_light(
     return out
 
 
+_POSTURE_PREFIX_RE = re.compile(
+    r"^(?:sitting|standing|walking|sit|stand|walk)(?:\s+and)?\s*", re.IGNORECASE
+)
+# El VLM ya no describe postura (se le pide explícitamente que no lo haga,
+# ver prompt_templates/compact.json) -- cuando no ve nada distinguible más
+# allá de la postura misma, contesta "idle" (o, si ignora la instrucción,
+# puede que siga diciendo "unknown"/vacío). ninguno de los dos es una
+# actividad real que anexar a la postura verificada.
+_NO_ACTIVITY = {"unknown", "idle", ""}
+
+
+def strip_posture_prefix(action: str) -> str:
+    """Quita el prefijo de postura ('sitting and ', 'standing', 'walking'...)
+    de una acción ya combinada (ver enrich_action_posture), dejando solo la
+    actividad específica -- o "idle" si no queda nada (la acción ERA solo
+    postura). Se usa para reportar 'action' y 'pose' como campos separados
+    en la salida (ROS/JSON), en vez de un único texto humano combinado."""
+    rest = _POSTURE_PREFIX_RE.sub("", action or "").strip()
+    return rest if rest and rest.lower() not in _NO_ACTIVITY else "idle"
+
+
 def enrich_action_posture(
     actions: dict[int, str],
     buffer_dets: list[list[dict]],
     person_ids: list[int],
     *,
     legs_visible: dict[int, bool] | None = None,
+    posture_hint: dict[int, str] | None = None,
 ) -> dict[int, str]:
-    """Antepone la postura ('standing'/'sitting') SOLO cuando el VLM no la
-    mencionó (p. ej. dijo solo 'talking' o 'eating' -> 'standing and eating').
+    """Postura ('standing'/'sitting'/'walking') separada de la actividad que
+    describe el VLM -- el VLM ya no debe juzgar postura en absoluto (prompt
+    actualizado), solo la actividad específica si hay alguna distinguible.
 
-    Si el texto YA trae su propia postura (p. ej. 'sit and eat', 'standing
-    and talking' — lo normal ahora que el prompt pide describir la actividad
-    real), se deja tal cual. ANTES esto se reconstruía siempre desde un set
-    cerrado de palabras clave (walk/run/sit/stand/talk/smile/phone), y
-    cualquier actividad fuera de ese set se perdía en silencio (medido:
-    "eating" quedaba reducido a solo "standing", con la persona sentada
-    comiendo reportada como si solo estuviera de pie).
+    `posture_hint` (pipeline de pose, ver vlm_hri.pose.gait.chunk_posture_by_pid
+    para sitting/standing por ángulo real de rodilla, y refine_labels_pose
+    para walking por marcha confirmada): postura AUTORITATIVA -- cuando hay
+    dato para un pid, se le quita al texto cualquier prefijo de postura que
+    el VLM haya puesto igualmente (por si no siguió la instrucción) y se
+    antepone la verificada, conservando la actividad específica si la hay
+    (p. ej. VLM dice "eating" y la rodilla mide sentado -> "sitting and
+    eating"; VLM dice "idle" -> se queda solo "sitting", sin "sitting and
+    idle"). Se exceptúa "running": el clasificador de ángulo no está
+    calibrado para correr, así que si el VLM ya lo dice se respeta tal cual.
 
-    `legs_visible` (pipeline de pose, ver vlm_hri.pose.gait.chunk_legs_visible_by_pid):
-    si dice explícitamente False para un pid (piernas fuera de cuadro, p. ej.
-    muy cerca de la cámara), NO se antepone ninguna postura adivinada — se
-    confía en el texto del VLM tal cual, siguiendo la misma lógica que el
-    prompt (no adivinar lo que no se puede ver). Ausente del dict (sin pose,
-    o sin dato de piernas ese trozo) cae al comportamiento de siempre
-    (adivinar por forma de caja vía infer_posture_light)."""
+    Sin `posture_hint` para un pid (sin pose ese trozo, piernas no
+    visibles, o ángulo en zona muerta), cae al comportamiento anterior: si
+    el texto YA trae su propia postura se deja tal cual; si no, se antepone
+    solo cuando `legs_visible` no diga explícitamente False (no adivinar lo
+    que no se puede ver), usando la heurística de forma de caja
+    (infer_posture_light) como último recurso."""
     if not buffer_dets:
         return actions
     postures = infer_posture_light(buffer_dets, person_ids)
+    hint = posture_hint or {}
     out: dict[int, str] = {}
     for pid in person_ids:
         act = normalize_action(actions.get(pid, "unknown"))
+        tr = _action_traits(act.lower()) if act != "unknown" else {}
+        verified = hint.get(pid)
+        if verified and not tr.get("running"):
+            if act.lower() in _NO_ACTIVITY:
+                out[pid] = verified
+                continue
+            rest = _POSTURE_PREFIX_RE.sub("", act).strip()
+            out[pid] = f"{verified} and {rest}" if rest and rest.lower() not in _NO_ACTIVITY else verified
+            continue
         if act == "unknown":
             out[pid] = act
             continue
-        tr = _action_traits(act.lower())
         if tr["walking"] or tr["running"] or tr["sitting"] or tr["standing"]:
             out[pid] = act
             continue
@@ -368,17 +402,20 @@ def refine_chunk_labels(
     *,
     moving_pids: set[int] | None = None,
     legs_visible: dict[int, bool] | None = None,
+    posture_hint: dict[int, str] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
     """Post-proceso VLM: cinemática, postura, debias de talk grupal, social coherente.
 
-    `moving_pids`/`legs_visible`: señales del pipeline de pose (marcha real +
-    piernas visibles), ver apply_chunk_kinematic_hints/enrich_action_posture.
-    Sin pose (pipeline clásico), ambos quedan en None y el comportamiento es
-    el de siempre."""
+    `moving_pids`/`legs_visible`/`posture_hint`: señales del pipeline de pose
+    (marcha real, piernas visibles, postura por ángulo real de rodilla), ver
+    apply_chunk_kinematic_hints/enrich_action_posture. Sin pose (pipeline
+    clásico), los tres quedan en None y el comportamiento es el de siempre."""
     acts = apply_chunk_kinematic_hints(
         actions, buffer_dets, person_ids, frame_size, moving_pids=moving_pids
     )
     acts, social = debias_group_talking(acts, social, person_ids, buffer_dets)
-    acts = enrich_action_posture(acts, buffer_dets, person_ids, legs_visible=legs_visible)
+    acts = enrich_action_posture(
+        acts, buffer_dets, person_ids, legs_visible=legs_visible, posture_hint=posture_hint
+    )
     social = resolve_social_states(acts, social, person_ids)
     return acts, social

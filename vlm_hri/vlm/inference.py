@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -23,10 +24,12 @@ from ..config import (
     chunk_vlm_use_image,
     vlm_prompt_mode,
     vlm_resize_limits,
+    vlm_target_source,
     video_vlm_fps,
 )
 from ..detection import sort_dets_left_right
 from ..drawing import annotate_for_vlm
+from ..pose.gait import vlm_prompt_with_motion_hint
 from ..social_state import (
     SOCIAL_UNKNOWN,
     coerce_action_social,
@@ -34,14 +37,29 @@ from ..social_state import (
     social_state_mode,
     use_vlm_social_states,
 )
-from .parsing import parse_vlm_response
-from .prompts import vlm_prompt
+from .parsing import parse_vlm_response, parse_vlm_target, parse_vlm_target_flags
 
 
 class VlmInferenceResult(NamedTuple):
     actions: dict[int, str]
     social_states: dict[int, str]
     elapsed_s: float
+    # Solo tienen entrada los pid donde el VLM realmente dio el campo (ver
+    # parse_vlm_response) -- ausencia != "el VLM dijo 0". Pass-through puro:
+    # nada del refinamiento cinemático (refine_labels_pose y compañía) los
+    # toca, a diferencia de actions/social_states.
+    confidence: dict[int, int] = {}
+    interrupt_cost: dict[int, int] = {}
+    # Target que eligió el propio VLM (ver prompt_templates/*.json, campo
+    # "target"): pid de una de las personas pasadas, o None si dijo que nadie
+    # es apto, omitió el campo o dio un ID que no existe. La confianza es la
+    # probabilidad del modelo para ese ID (ver target_token_probability).
+    target_pid: int | None = None
+    target_confidence: float | None = None
+    # P(t=1) por persona sacada de los logits del flag "t" de cada una (ver
+    # target_flag_probabilities) -- también para las que el VLM marcó con 0.
+    # Vacío con el formato viejo "target": <ID> o en batch (sin scores).
+    target_probs: dict[int, float] = {}
 
 
 def actions_for_ids(actions: dict[int, str], person_ids: list[int]) -> dict[int, str]:
@@ -61,19 +79,116 @@ def resize_max_side(pil: Image.Image, max_side: int) -> Image.Image:
 def _vlm_max_new_tokens(n_people: int) -> int:
     _, _, max_new_cap = vlm_resize_limits()
     if vlm_prompt_mode() == "compact":
-        extra = 10 if use_vlm_social_states() else 0
-        budget = max(28, 10 + 9 * n_people + extra)
+        # Medido con el tokenizer de Qwen2-VL: ~20 tokens por persona
+        # ({"a": "...", "s": "ATTENTIVE"}) + ~6 de "target".
+        # El target va al final del JSON: si se corta por max_new_cap
+        # (VLM_PROFILE, 120 en balanced => ~5 personas), se pierde primero.
+        # +5 por persona del flag "t" (`,"t":1`), solo si el prompt lo pide.
+        per = 25 if vlm_target_source() == "vlm" else 20
+        budget = max(28, 8 + per * n_people) if use_vlm_social_states() else max(28, 10 + 9 * n_people)
     else:
-        extra = 28 if use_vlm_social_states() else 0
-        budget = max(40, 20 + 14 * n_people + extra)
+        # Claves largas ('action'/'social') cuestan ~4 tokens más por persona.
+        budget = max(36, 12 + 24 * n_people) if use_vlm_social_states() else max(40, 20 + 14 * n_people)
     return min(max_new_cap, budget)
+
+
+_TARGET_VALUE_RE = re.compile(r'"?target(?:_id)?"?\s*:\s*"?(?:ID)?', re.IGNORECASE)
+
+
+def target_token_probability(
+    tokenizer, gen_ids: list[int], scores: tuple, target_pid: int, person_ids: list[int]
+) -> float | None:
+    """Probabilidad que el propio modelo le dio a ESA persona como target,
+    frente a las otras personas del trozo, sacada de sus logits.
+
+    En el primer dígito del ID tras `"target":` se renormaliza solo sobre los
+    primeros dígitos de los IDs candidatos: el resto de la masa es formato
+    (medido: con `"target": "1"` el competidor del dígito era el token `ID`
+    de `"ID1"`, lo que daba ~0.5 aunque solo hubiera una persona). Los
+    dígitos siguientes (IDs de 2+ cifras) usan su probabilidad tal cual.
+    No incluye la alternativa `null` (condicionada a que eligió a alguien);
+    con una sola persona es 1.0 por definición. None si el ID no aparece en
+    la salida con esa forma."""
+    pieces = [tokenizer.decode([t]) for t in gen_ids]
+    starts, pos = [], 0
+    for piece in pieces:
+        starts.append(pos)
+        pos += len(piece)
+    text = "".join(pieces)
+    m = _TARGET_VALUE_RE.search(text)
+    if m is None:
+        return None
+    digits = re.match(r"\d+", text[m.end():])
+    if digits is None or int(digits.group()) != target_pid:
+        return None
+    lo, hi = m.end(), m.end() + len(digits.group())
+    idx = [i for i, st in enumerate(starts) if st < hi and st + len(pieces[i]) > lo]
+    if not idx or idx[-1] >= len(scores) or starts[idx[0]] != lo:
+        return None
+    first_digit_ids = {
+        tokenizer.encode(str(pid)[0], add_special_tokens=False)[0] for pid in person_ids
+    }
+    prob = 1.0
+    for n, i in enumerate(idx):
+        dist = torch.softmax(scores[i][0].float(), dim=-1)
+        p_tok = float(dist[gen_ids[i]])
+        if n == 0:
+            p_tok /= max(float(dist[sorted(first_digit_ids)].sum()), 1e-12)
+        prob *= p_tok
+    return prob
+
+
+_PERSON_OPEN_RE = re.compile(r'"?(\d+)"?\s*:\s*\{')
+_FLAG_VALUE_RE = re.compile(r'(?<![A-Za-z_])"?t"?\s*:\s*"?')
+
+
+def target_flag_probabilities(
+    tokenizer, gen_ids: list[int], scores: tuple, person_ids: list[int]
+) -> dict[int, float]:
+    """P(t=1) por persona, de los logits del token del valor de su flag
+    "t", renormalizada solo sobre "0" vs "1" (el resto de la masa es
+    formato). Cada `"t":` se asigna a la última clave de persona abierta
+    antes que él. Personas cuyo flag no se pudo ubicar en la salida no
+    aparecen."""
+    pieces = [tokenizer.decode([t]) for t in gen_ids]
+    starts, pos = [], 0
+    for piece in pieces:
+        starts.append(pos)
+        pos += len(piece)
+    text = "".join(pieces)
+    allowed = set(person_ids)
+    opens = [(m.start(), int(m.group(1))) for m in _PERSON_OPEN_RE.finditer(text)]
+    out: dict[int, float] = {}
+    for m in _FLAG_VALUE_RE.finditer(text):
+        owner = [pid for st, pid in opens if st < m.start()]
+        if not owner or owner[-1] not in allowed or owner[-1] in out:
+            continue
+        lo = m.end()
+        if lo >= len(text) or text[lo] not in "01":
+            continue
+        i = next((i for i, st in enumerate(starts) if st <= lo < st + len(pieces[i])), None)
+        if i is None or i >= len(scores):
+            continue
+        piece = pieces[i]
+        rel = lo - starts[i]
+        alt_piece = piece[:rel] + ("0" if piece[rel] == "1" else "1") + piece[rel + 1:]
+        alt = tokenizer.encode(alt_piece, add_special_tokens=False)
+        if len(alt) != 1:
+            continue
+        dist = torch.softmax(scores[i][0].float(), dim=-1)
+        p_tok, p_alt = float(dist[gen_ids[i]]), float(dist[alt[0]])
+        p_one = p_tok if piece[rel] == "1" else p_alt
+        out[owner[-1]] = p_one / max(p_tok + p_alt, 1e-12)
+    return out
 
 
 def _postprocess_vlm_raw(
     raw: str, person_ids: list[int], elapsed: float
 ) -> VlmInferenceResult:
     raw = "{" + raw.lstrip("{").strip()
-    parsed_actions, parsed_social = parse_vlm_response(raw, person_ids)
+    parsed_actions, parsed_social, parsed_confidence, parsed_cost = parse_vlm_response(
+        raw, person_ids
+    )
     coerced_actions: dict[int, str] = {}
     coerced_social: dict[int, str] = {}
     for pid in person_ids:
@@ -86,14 +201,24 @@ def _postprocess_vlm_raw(
         coerced_social[pid] = s
     actions = actions_for_ids(coerced_actions, person_ids)
     social = resolve_social_states(actions, coerced_social, person_ids)
-    if VLM_DEBUG or all(a == "unknown" for a in actions.values()):
+    confidence = {pid: c for pid, c in parsed_confidence.items() if c is not None}
+    interrupt_cost = {pid: c for pid, c in parsed_cost.items() if c is not None}
+    # La confianza la pone _generate_json desde los logits (ver
+    # target_token_probability); aquí solo se toma el ID.
+    target_pid = parse_vlm_target(raw, person_ids)[0] if use_vlm_social_states() else None
+    target_conf = None
+    if VLM_DEBUG or all(a == "unknown" for a in actions.values()) or any(
+        parsed_social.get(pid, SOCIAL_UNKNOWN) == SOCIAL_UNKNOWN for pid in person_ids
+    ):
         print(f"  VLM raw: {raw!r}", flush=True)
         print(
             f"  VLM IDs {person_ids} → actions={actions} social={social} "
-            f"(mode={social_state_mode()})",
+            f"target={target_pid} p={target_conf} (mode={social_state_mode()})",
             flush=True,
         )
-    return VlmInferenceResult(actions, social, elapsed)
+    return VlmInferenceResult(
+        actions, social, elapsed, confidence, interrupt_cost, target_pid, target_conf
+    )
 
 
 def _generate_json(
@@ -114,14 +239,40 @@ def _generate_json(
     ).to(dev)
     with torch.inference_mode():
         out = model.generate(
-            **inputs, max_new_tokens=max_new, do_sample=False, use_cache=True
+            **inputs, max_new_tokens=max_new, do_sample=False, use_cache=True,
+            output_scores=True, return_dict_in_generate=True,
         )
-    raw = processor.batch_decode(
-        [o[len(i) :] for i, o in zip(inputs.input_ids, out)],
-        skip_special_tokens=True,
-    )[0]
+    gen_ids = out.sequences[0][inputs.input_ids.shape[1]:].tolist()
+    raw = processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
     elapsed = time.perf_counter() - t0
-    return _postprocess_vlm_raw(raw, person_ids, elapsed)
+    result = _postprocess_vlm_raw(raw, person_ids, elapsed)
+    if VLM_DEBUG:
+        print(
+            f"  VLM tokens: entrada={inputs.input_ids.shape[1]} generados={len(gen_ids)} "
+            f"(max_new={max_new}) en {elapsed:.2f}s",
+            flush=True,
+        )
+    # La confianza del target sale de los logits del modelo, no de un número
+    # que el modelo escriba (medido: pedido en texto, "target_conf" era
+    # siempre 1.0 y además gastaba tokens).
+    if use_vlm_social_states() and parse_vlm_target_flags(raw, person_ids) is not None:
+        probs = target_flag_probabilities(processor.tokenizer, gen_ids, out.scores, person_ids)
+        flagged = parse_vlm_target_flags(raw, person_ids) or []
+        target_pid = result.target_pid
+        if len(flagged) > 1 and probs:
+            # Varios "t": 1 -- se queda el que el modelo más quería.
+            target_pid = max(flagged, key=lambda p: probs.get(p, 0.0))
+        return result._replace(
+            target_pid=target_pid,
+            target_confidence=probs.get(target_pid) if target_pid is not None else None,
+            target_probs=probs,
+        )
+    if result.target_pid is None:
+        return result
+    prob = target_token_probability(
+        processor.tokenizer, gen_ids, out.scores, result.target_pid, person_ids
+    )
+    return result._replace(target_confidence=prob)
 
 
 def _generate_json_batch(
@@ -241,7 +392,7 @@ def infer_actions_image(
                 "role": "user",
                 "content": [
                     {"type": "image", "image": pil_r},
-                    {"type": "text", "text": vlm_prompt(dets, video=False)},
+                    {"type": "text", "text": vlm_prompt_with_motion_hint(dets, video=False)},
                 ],
             }
         ]
@@ -346,7 +497,7 @@ def _video_messages(
             "role": "user",
             "content": [
                 video_content,
-                {"type": "text", "text": vlm_prompt(prompt_dets, video=True)},
+                {"type": "text", "text": vlm_prompt_with_motion_hint(prompt_dets, video=True)},
             ],
         }
     ]

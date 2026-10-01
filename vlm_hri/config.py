@@ -88,6 +88,25 @@ def chunk_vlm_use_image(chunk_sec: float) -> bool:
     return limit > 0 and chunk_sec <= limit
 
 
+def vlm_target_source() -> str:
+    """Quién elige el target de interacción: "rules" (default) = reglas
+    sobre las etiquetas 's' por persona (ATTENTIVE > AVAILABLE > más cercano,
+    ver pose.gait.pick_interaction_target) y el VLM ni lo menciona en el
+    prompt; "vlm" = flag "t" por persona en el prompt. Medido con
+    Qwen2-VL-2B en video: con "vlm" el modelo escribió "t": 0 para todos en
+    25/25 trozos y P(t=1) de los logits favorecía siempre a la PRIMERA
+    persona escrita (23/23) -- sesgo de posición, no elección."""
+    s = os.environ.get("VLM_TARGET_SOURCE", "rules").strip().lower()
+    return s if s in ("rules", "vlm") else "rules"
+
+
+def vlm_motion_hint() -> bool:
+    """Pista de movimiento para el VLM: cajas azul/roja según la marcha + una
+    nota en el prompt. 0 = cajas de un solo color neutro y sin nota (para
+    medir si el VLM juzga el movimiento por sí mismo o copia el color)."""
+    return os.environ.get("VLM_MOTION_HINT", "1").strip() != "0"
+
+
 def vlm_prompt_mode() -> str:
     """full = prompt largo; compact = corto (menos latencia, default)."""
     m = os.environ.get("VLM_PROMPT_MODE", "compact").strip().lower()

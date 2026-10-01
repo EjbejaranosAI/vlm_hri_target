@@ -7,6 +7,7 @@ chunk_gait_by_pid no puede aportar nada), ese hint no debe forzar "walking"."""
 
 import numpy as np
 
+from vlm_hri.motion import strip_posture_prefix
 from vlm_hri.pose.gait import refine_labels_pose
 from vlm_hri.social_state import SOCIAL_ATTENTIVE
 
@@ -54,7 +55,7 @@ def test_depth_only_hint_does_not_force_walking_without_legs():
     # Simula lo que ya decidió Fase 1 (gait+depth+histéresis, ver
     # _pose_vlm_worker): con piernas no visibles, gait no pudo aportar nada,
     # así que este hint viene solo de la señal de profundidad.
-    acts, _soc = refine_labels_pose(
+    acts, _soc, _pose = refine_labels_pose(
         actions, social, buffer_dets, [1], frame_size=(640, 480), moving_pids_hint={1}
     )
 
@@ -78,14 +79,15 @@ def _standing_kpts() -> np.ndarray:
     return kpts
 
 
-def test_kinematic_hint_never_rewrites_the_vlm_text_even_with_real_gait():
-    """El VLM ya ve el clip de varios frames (+ pista de color) y decide el
-    movimiento él mismo -- ni con evidencia cinemática real y confirmada
-    (piernas visibles, moving_pids_hint activo) se le reescribe el texto de
-    la acción. `moving_pids_hint`/`confirmed_moving` solo sirven para
-    corregir el sesgo de grupo conocido (debias_group_walking) y para la
-    pista de color del prompt, nunca para inyectar/quitar "walking" del
-    texto -- ver refine_labels_pose."""
+def test_kinematic_hint_now_sets_authoritative_walking_posture():
+    """Postura ("sitting"/"standing"/"walking") ya no la juzga el VLM en
+    absoluto -- con marcha real confirmada (piernas visibles,
+    moving_pids_hint activo) SÍ se inyecta "walking" en el texto combinado
+    y en el `pose` devuelto aparte, sobre cualquier postura que hubiera
+    inferido `chunk_posture_by_pid` del ángulo de rodilla (aquí, piernas
+    rectas -> "standing" sin la marcha). La actividad específica que
+    describe el VLM ("watch camera") se conserva anexada, sin que el texto
+    de postura la pise -- ver refine_labels_pose/enrich_action_posture."""
     buffer_dets = [
         [{"pid": 2, "x1": 100, "y1": 100, "x2": 200, "y2": 300, "kpts": _standing_kpts()}]
         for _ in range(10)
@@ -93,12 +95,10 @@ def test_kinematic_hint_never_rewrites_the_vlm_text_even_with_real_gait():
     actions = {2: "watch camera"}
     social = {2: SOCIAL_ATTENTIVE}
 
-    acts, _soc = refine_labels_pose(
+    acts, _soc, pose = refine_labels_pose(
         actions, social, buffer_dets, [2], frame_size=(640, 480), moving_pids_hint={2}
     )
 
-    # enrich_action_posture puede anteponer "standing"/"sitting" inferido de
-    # la caja (eso es aparte, y sigue activo) -- lo que NO debe pasar es que
-    # "walking" aparezca en el texto solo por la señal cinemática.
-    assert "watch camera" in acts[2], acts
-    assert "walking" not in acts[2].lower(), acts
+    assert pose[2] == "walking", pose
+    assert "walking" in acts[2].lower(), acts
+    assert strip_posture_prefix(acts[2]) == "watch camera", acts

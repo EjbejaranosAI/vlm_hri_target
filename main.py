@@ -68,6 +68,13 @@ def main() -> None:
         "--draw-pose", action="store_true",
         help="Dibuja el esqueleto de pose también en el video/ventana final (solo con pose activo)",
     )
+    p_stream.add_argument(
+        "--target-filter", choices=("raw", "ema", "hyst"), default=None,
+        help="Qué target maneja el overlay: raw (VLM tal cual), ema, hyst (EMA+histéresis). "
+        "Los 3 se calculan y van a summary.json igual. Default: $VLM_TARGET_FILTER o raw",
+    )
+    p_stream.add_argument("--target-alpha", type=float, default=None, help="EMA alpha (default 0.5)")
+    p_stream.add_argument("--target-min-stable", type=int, default=None, help="Trozos seguidos para cambiar (default 2)")
 
     args = parser.parse_args()
 
@@ -87,6 +94,7 @@ def main() -> None:
         )
     else:
         from vlm_hri.runners.stream import run as run_stream
+        from vlm_hri.target_filter import TargetFilterConfig
 
         run_stream(
             video_path=args.input,
@@ -98,6 +106,9 @@ def main() -> None:
             preview=args.preview,
             realtime=args.realtime,
             max_frames=args.max_frames,
+            target_filter=TargetFilterConfig.from_env(
+                mode=args.target_filter, alpha=args.target_alpha, min_stable=args.target_min_stable,
+            ),
         )
 
 

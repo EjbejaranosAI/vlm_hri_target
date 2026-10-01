@@ -10,12 +10,36 @@
 vlm_hri_node:
   ros__parameters:
     image_topic: "/head_front_camera/color/image_raw"
-    detections_topic: "/detections/tracked"
+    detections_topic: "/detections/tracked_fov"
     use_dynamic_tracking: true  # false = solo cámara, detección/tracking propios (sin LiDAR)
     image_qos_reliability: "best_effort"
     frame_id: "odom"
     chunk_sec: 1.0
+    # assumed_fps ya NO se usa tal cual: vlm_hri_node mide el fps real de
+    # llegada de frames (evento, no ritmo fijo -- con dynamic_tracking depende
+    # de SU pipeline, ~9-10Hz medido, no de este número) durante los primeros
+    # fps_calibration_samples callbacks, y usa esa medida en su lugar. Este
+    # valor solo se usa como último recurso si la medición falla (span<=0).
     assumed_fps: 30.0
+    fps_calibration_samples: 20
     use_pose: true
     draw_pose: false
     sync_slop_sec: 0.10
+    # Filtro temporal del target (vlm_hri/target_filter.py). Los 3 modos se
+    # calculan siempre y salen en /vlm_hri/target_filter (grabar con rosbag
+    # para comparar); target_filter elige cuál va a /vlm_hri/target_pose:
+    #   raw  = target del VLM tal cual, trozo a trozo (comportamiento previo)
+    #   ema  = argmax de la EMA de votos (incluye "nadie" como clase)
+    #   hyst = EMA + histéresis (cambia tras min_stable trozos y > enter;
+    #          suelta si < exit, si pasa a MOVING o si no se ve > absent_chunks)
+    target_filter: "raw"
+    target_ema_alpha: 0.5
+    target_enter_threshold: 0.5
+    target_exit_threshold: 0.25
+    target_min_stable: 2
+    target_absent_chunks: 2
+    # Si el VLM dice target=null pero él mismo marcó a alguien ATTENTIVE/
+    # AVAILABLE (se contradice), se vota por ese pid con este peso en vez de
+    # por "nadie". 0.5: alcanza para CONSERVAR el target, no para crearlo.
+    # 0 = desactivado.
+    target_fallback_weight: 0.5

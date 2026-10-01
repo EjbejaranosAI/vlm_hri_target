@@ -54,6 +54,7 @@ from ..drawing import annotate_for_vlm, draw_banner_video, draw_box, format_dete
 from ..motion import refine_chunk_labels
 from ..pose import gait as pose_gait
 from ..social_state import SOCIAL_UNKNOWN, social_state_mode, social_states_from_actions
+from .. import target_filter as tfilter
 from ..vlm.inference import VlmInferenceResult, infer_actions_image, infer_actions_video, warmup_vlm
 from ..vlm.model import load_vlm
 
@@ -803,11 +804,13 @@ def _run_pose(
     processor=None,
     device=None,
     draw_pose: bool = False,
+    target_filter: tfilter.TargetFilterConfig | None = None,
 ) -> Path:
     if (video_path is None) == (camera is None):
         raise SystemExit("Indica --input VIDEO o --camera N (no ambos).")
 
     chunk_sec = float(os.environ.get("VIDEO_VLM_CHUNK_SEC", str(VIDEO_VLM_CHUNK_SEC)))
+    target_filter = target_filter or tfilter.TargetFilterConfig.from_env()
     if device is None:
         device = resolve_device()
     out_name = video_path.stem.replace("_h264", "") if video_path else f"camera_{camera}"
@@ -864,6 +867,7 @@ def _run_pose(
     session = PoseStreamSession(
         w=w, h=h, fps=fps, chunk_sec=chunk_sec, chunk_dir=chunk_dir,
         vlm=vlm, processor=processor, draw_pose=draw_pose, sinks=[video_sink],
+        target_filter=target_filter,
     )
     session.start()
 
@@ -895,6 +899,7 @@ def _run_pose(
                 with session.state.lock:
                     actions = dict(session.state.actions)
                     social_states = dict(session.state.social_states)
+                    pose = dict(session.state.pose)
                     vlm_pending = session.state.vlm_pending
                     yolo_acum, vlm_acum, vlm_n = (
                         session.state.yolo_total_s, session.state.vlm_total_s, session.state.vlm_calls,
@@ -909,6 +914,7 @@ def _run_pose(
                         yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
                         pipeline_total_s=time.perf_counter() - session.t_pipeline0, vlm_pending=vlm_pending,
                         draw_pose=draw_pose,
+                        pose=pose,
                     )
                     cv2.imshow("stream-pose", display_ann)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -982,10 +988,14 @@ def _run_pose(
         "vlm_chunk_latencies_s": [t["latency_s"] for t in vlm_chunk_timings],
         **video_io.vlm_timing_stats([t["latency_s"] for t in vlm_chunk_timings]),
         "segments": _build_segment_summary(segment_actions, segment_social, vlm_chunk_timings),
+        "target_filter": tfilter.summarize(result["segment_target_filter"], target_filter, chunk_sec),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     vname = video_path.name if video_path else f"camera_{camera}"
     video_io.print_vlm_latency_report(vname, vlm_chunk_timings)
+    print(f"  Target (modo activo: {target_filter.mode}):", flush=True)
+    for mode, m in summary["target_filter"]["metrics"].items():
+        print(f"    {mode:5s} {m}", flush=True)
     print(
         f"\nStream [pose] listo → {out} ({pipeline_total_s:.1f}s, {frame_i} frames, "
         f"VLM {vlm_calls} trozos, factor RT {rt['realtime_factor']:.2f}x)",
@@ -1011,6 +1021,7 @@ def run(
     vlm=None,
     processor=None,
     device=None,
+    target_filter: tfilter.TargetFilterConfig | None = None,
 ) -> Path:
     """Cámara o video en vivo. `use_pose=True` (default): detector de pose +
     marcha por piernas, ATTENTIVE por mirada y target de interacción
@@ -1022,7 +1033,7 @@ def run(
             video_path=video_path, camera=camera, output_dir=output_dir,
             display=display, preview=preview, realtime=realtime, max_frames=max_frames,
             yolo=yolo, yolo_pose=yolo_pose, vlm=vlm, processor=processor, device=device,
-            draw_pose=draw_pose,
+            draw_pose=draw_pose, target_filter=target_filter,
         )
     return _run_plain(
         video_path=video_path, camera=camera, output_dir=output_dir,
