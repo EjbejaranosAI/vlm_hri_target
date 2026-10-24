@@ -32,7 +32,23 @@ Un pid que deja de verse conserva su score congelado hasta `absent_chunks`
 trozos (oclusión corta / pid que el VLM no recibió ese trozo) y luego se
 olvida.
 
-Los 3 modos ("raw", "ema", "hyst") se calculan SIEMPRE en paralelo sobre la
+c) Voto continuo -- cada persona vista aporta una evidencia e_i en [0, 1]
+   de que ES abordable (ver target_evidence: con VLM_BACKEND=vlm_jev,
+   P(ATTENTIVE)+P(AVAILABLE) del modelo; con el VLM generativo, una tabla
+   por estado ya refinado), no solo el ganador del trozo:
+   - "ema_c": EMA por persona de e_i; target = argmax si >= enter_threshold.
+   - "bayes": filtro de Bayes discreto (el caso exacto de un filtro de
+     partículas cuando la hipótesis es finita): b(h) sobre
+     h in {nadie, pid_1..pid_n}. Predicción: b <- stay*b + (1-stay)/|H|
+     (el target real cambia poco entre trozos). Actualización: verosimilitud
+     L(pid) = e/(1-e) (odds de que sea abordable), L(nadie) = 1; un pid no
+     visto ese trozo no aporta (L = 1). Decisión: P(alguien) = 1 - b(nadie)
+     >= enter para crear target y >= exit para conservarlo; un retador
+     reemplaza al actual solo si su b le saca `bayes_margin` durante
+     `min_stable` trozos seguidos (con varias personas igual de abordables
+     la masa se reparte y el argmax solo cambiaría por ruido).
+
+Todos los modos ("raw", "ema", "hyst", "ema_c", "bayes") se calculan SIEMPRE en paralelo sobre la
 misma secuencia de votos -- `mode` solo decide cuál maneja al robot/overlay.
 Así una sola corrida da la comparación sin el ruido de que el VLM no es
 determinista entre corridas. `replay()` re-simula offline con otros
@@ -46,11 +62,58 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass, field, replace
 
-from .social_state import SOCIAL_ATTENTIVE, SOCIAL_AVAILABLE, SOCIAL_MOVING
+from .social_state import (
+    SOCIAL_ATTENTIVE,
+    SOCIAL_AVAILABLE,
+    SOCIAL_BUSY,
+    SOCIAL_ENGAGED,
+    SOCIAL_MOVING,
+    SOCIAL_UNKNOWN,
+)
 
-TARGET_FILTER_MODES = ("raw", "ema", "hyst")
+TARGET_FILTER_MODES = ("raw", "ema", "hyst", "ema_c", "bayes")
 TARGET_SOURCES = ("rules", "vlm")
 _ELIGIBLE = {SOCIAL_ATTENTIVE, SOCIAL_AVAILABLE}
+# Evidencia de "es abordable" cuando no hay probabilidades del modelo (VLM
+# generativo) o cuando la pose contradijo al modelo (p. ej. marcha -> MOVING).
+_STATE_EVIDENCE = {
+    SOCIAL_ATTENTIVE: 0.9,
+    SOCIAL_AVAILABLE: 0.7,
+    SOCIAL_BUSY: 0.1,
+    SOCIAL_ENGAGED: 0.1,
+    SOCIAL_MOVING: 0.02,
+    SOCIAL_UNKNOWN: 0.5,
+}
+_EVIDENCE_CLIP = 0.02  # e en [clip, 1-clip]: odds acotadas a [1/49, 49]
+
+
+def target_evidence(
+    social_states: dict[int, str],
+    social_probs: dict[int, dict[str, float]] | None = None,
+    model_social: dict[int, str] | None = None,
+) -> dict[int, float]:
+    """e_i en [0, 1] = cuánto parece abordable cada persona este trozo.
+    Con probabilidades (JEV): P(ATTENTIVE) + P(AVAILABLE); si el refinado
+    por pose cambió el estado que dijo el modelo (marcha -> MOVING, de
+    espaldas -> BUSY, mirada -> ATTENTIVE), manda la pose: valor de tabla
+    de ese estado. Sin probabilidades: tabla por estado."""
+    out = {}
+    for pid, st in social_states.items():
+        table = _STATE_EVIDENCE.get(st, _STATE_EVIDENCE[SOCIAL_UNKNOWN])
+        probs = (social_probs or {}).get(pid)
+        if not probs:
+            out[pid] = table
+            continue
+        if (model_social or {}).get(pid, st) != st:
+            out[pid] = table
+        else:
+            out[pid] = probs.get(SOCIAL_ATTENTIVE, 0.0) + probs.get(SOCIAL_AVAILABLE, 0.0)
+    return out
+
+
+# Trozos seguidos que el mismo pid debe ganar el voto crudo para que su voto
+# cuente aunque haya otro del mismo nivel con más historia (ver _sticky_pid).
+_CHALLENGER_RUN = 2
 
 
 @dataclass(frozen=True)
@@ -68,6 +131,8 @@ class TargetFilterConfig:
     min_stable: int = 2
     absent_chunks: int = 2
     fallback_weight: float = 0.5  # voto por el mejor elegible si el VLM dice null (0 = off)
+    bayes_stay: float = 0.9  # "bayes": P(el target real sigue siendo el mismo entre trozos)
+    bayes_margin: float = 0.1  # "bayes": ventaja en b() que necesita un retador para robar el target
 
     def __post_init__(self) -> None:
         if self.mode not in TARGET_FILTER_MODES:
@@ -78,6 +143,8 @@ class TargetFilterConfig:
             raise ValueError(f"target_filter alpha={self.alpha} fuera de (0, 1]")
         if not 0.0 <= self.fallback_weight <= 1.0:
             raise ValueError(f"target_filter fallback_weight={self.fallback_weight} fuera de [0, 1]")
+        if not 0.0 < self.bayes_stay < 1.0:
+            raise ValueError(f"target_filter bayes_stay={self.bayes_stay} fuera de (0, 1)")
 
     @classmethod
     def from_env(cls, **overrides) -> "TargetFilterConfig":
@@ -93,6 +160,8 @@ class TargetFilterConfig:
             min_stable=int(env("VLM_TARGET_MIN_STABLE", cls.min_stable)),
             absent_chunks=int(env("VLM_TARGET_ABSENT_CHUNKS", cls.absent_chunks)),
             fallback_weight=float(env("VLM_TARGET_FALLBACK_WEIGHT", cls.fallback_weight)),
+            bayes_stay=float(env("VLM_TARGET_BAYES_STAY", cls.bayes_stay)),
+            bayes_margin=float(env("VLM_TARGET_BAYES_MARGIN", cls.bayes_margin)),
         )
         return replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
 
@@ -112,6 +181,17 @@ class TargetFilter:
     _current: int | None = None
     _streak_key: int | None = None
     _streak_n: int = 0
+    _raw_last: int | None = None
+    _raw_run: int = 0
+    # "ema_c": EMA de la evidencia continua por persona.
+    cscores: dict[int, float] = field(default_factory=dict)
+    _c_absent: dict[int, int] = field(default_factory=dict)
+    # "bayes": creencia sobre quién es el target (None = nadie).
+    belief: dict[int | None, float] = field(default_factory=lambda: {None: 1.0})
+    _b_absent: dict[int, int] = field(default_factory=dict)
+    _b_current: int | None = None
+    _b_challenger: int | None = None
+    _b_challenger_n: int = 0
 
     def _votes(
         self,
@@ -122,12 +202,31 @@ class TargetFilter:
     ) -> dict[int | None, float]:
         if raw_pid is not None and social_states.get(raw_pid) in _ELIGIBLE:
             c = 1.0 if raw_conf is None else min(1.0, max(0.0, float(raw_conf)))
-            return {raw_pid: c, None: 1.0 - c}
+            return {self._sticky_pid(raw_pid, social_states, seen): c, None: 1.0 - c}
         fb = self._fallback_pid(social_states, seen)
         if fb is None or self.cfg.fallback_weight <= 0.0:
             return {None: 1.0}
         w = self.cfg.fallback_weight
         return {fb: w, None: 1.0 - w}
+
+    def _sticky_pid(self, raw_pid: int, social_states: dict[int, str], seen: set[int]) -> int:
+        """Entre personas del MISMO nivel que el voto crudo (todas ATTENTIVE o
+        todas AVAILABLE), vota por el target actual y si no por el de mayor
+        score acumulado, no por el ganador de este trozo. Medido en
+        watching_robot_2.mp4 (5 personas mirando al robot, cajas de tamaño
+        parecido): el desempate por caja más grande cambiaba de ganador casi
+        cada trozo (5,3,5,4,5,3,1), los votos se repartían y la histéresis
+        pasaba 14 trozos SIN target. Un nivel mejor (ATTENTIVE sobre
+        AVAILABLE) sigue ganando siempre, y si el MISMO retador gana el voto
+        crudo `_CHALLENGER_RUN` trozos seguidos (p. ej. alguien que se acerca
+        y pasa a ser el más cercano) su voto cuenta tal cual."""
+        if self._raw_run >= _CHALLENGER_RUN:
+            return raw_pid  # mismo retador varios trozos seguidos: cambio real
+        tier = social_states[raw_pid]
+        same = [p for p in seen if social_states.get(p) == tier] or [raw_pid]
+        if raw_pid not in same:
+            same.append(raw_pid)
+        return min(same, key=lambda p: (p != self._current, -self.scores.get(p, 0.0), p != raw_pid, p))
 
     def _fallback_pid(self, social_states: dict[int, str], seen: set[int]) -> int | None:
         """Mejor elegible visto este trozo (para cuando el VLM dice null pero
@@ -165,17 +264,97 @@ class TargetFilter:
         # entre pids el menor (determinista).
         return min(self.scores, key=lambda k: (-self.scores[k], k is not None, k or 0))
 
+    def _age_out(self, store: dict, absent: dict[int, int], seen: set[int]) -> None:
+        """Cuenta trozos sin ver cada pid de `store` y lo borra tras absent_chunks."""
+        for key in [k for k in store if k is not None]:
+            if key in seen:
+                absent.pop(key, None)
+                continue
+            absent[key] = absent.get(key, 0) + 1
+            if absent[key] > self.cfg.absent_chunks:
+                del store[key]
+                del absent[key]
+
+    def _update_ema_c(self, evidence: dict[int, float], seen: set[int]) -> TargetDecision:
+        self._age_out(self.cscores, self._c_absent, seen)
+        a = self.cfg.alpha
+        for pid in seen:
+            self.cscores[pid] = a * evidence.get(pid, 0.0) + (1.0 - a) * self.cscores.get(pid, 0.0)
+        if not self.cscores:
+            return TargetDecision(None, None)
+        leader = min(self.cscores, key=lambda p: (-self.cscores[p], p))
+        if self.cscores[leader] < self.cfg.enter_threshold:
+            return TargetDecision(None, None)
+        return TargetDecision(leader, self.cscores[leader])
+
+    def _update_bayes(
+        self, evidence: dict[int, float], social_states: dict[int, str], seen: set[int]
+    ) -> TargetDecision:
+        b = self.belief
+        for pid in seen:
+            b.setdefault(pid, 0.0)
+        self._age_out(b, self._b_absent, seen)
+        # Predicción: el target real se mantiene con prob. stay, si no salta
+        # a cualquier hipótesis (incluida "nadie") por igual.
+        stay, n = self.cfg.bayes_stay, len(b)
+        total = sum(b.values()) or 1.0
+        for h in b:
+            b[h] = stay * b[h] / total + (1.0 - stay) / n
+        # Actualización con la evidencia de este trozo.
+        lo, hi = _EVIDENCE_CLIP, 1.0 - _EVIDENCE_CLIP
+        for pid in b:
+            if pid is not None and pid in seen:
+                e = min(hi, max(lo, evidence.get(pid, 0.5)))
+                b[pid] *= e / (1.0 - e)
+        total = sum(b.values())
+        for h in b:
+            b[h] /= total
+
+        p_any = 1.0 - b[None]
+        # Nunca adoptar (ni como retador) a quien está MOVING este trozo.
+        pids = [p for p in b if p is not None and not (p in seen and social_states.get(p) == SOCIAL_MOVING)]
+        leader = min(pids, key=lambda p: (-b[p], p)) if pids else None
+        cur = self._b_current
+        if cur is not None and (
+            cur not in b
+            or p_any < self.cfg.exit_threshold
+            or (cur in seen and social_states.get(cur) == SOCIAL_MOVING)
+        ):
+            cur = None
+        if cur is None:
+            self._b_challenger, self._b_challenger_n = None, 0
+            if leader is not None and p_any >= self.cfg.enter_threshold:
+                cur = leader
+        elif leader != cur and b[leader] >= b[cur] + self.cfg.bayes_margin:
+            if leader == self._b_challenger:
+                self._b_challenger_n += 1
+            else:
+                self._b_challenger, self._b_challenger_n = leader, 1
+            if self._b_challenger_n >= self.cfg.min_stable:
+                cur = leader
+                self._b_challenger, self._b_challenger_n = None, 0
+        else:
+            self._b_challenger, self._b_challenger_n = None, 0
+        self._b_current = cur
+        return TargetDecision(cur, b[cur] if cur is not None else None)
+
     def update(
         self,
         raw_pid: int | None,
         raw_conf: float | None,
         social_states: dict[int, str],
         seen_pids: set[int],
+        evidence: dict[int, float] | None = None,
     ) -> dict[str, TargetDecision]:
         """Llamar UNA vez por trozo de VLM (no por frame) con el target crudo,
         el estado social YA refinado de ese trozo y los pids que se le pasaron
-        al VLM. Devuelve la decisión de los 3 modos."""
+        al VLM. `evidence`: e_i por persona (ver target_evidence); None = la
+        tabla por estado social. Devuelve la decisión de todos los modos."""
         seen = set(seen_pids)
+        if evidence is None:
+            evidence = target_evidence(social_states)
+        self._raw_run = self._raw_run + 1 if raw_pid == self._raw_last else 1
+        self._raw_last = raw_pid
         self._update_scores(self._votes(raw_pid, raw_conf, social_states, seen), seen)
 
         leader = self._leader()
@@ -202,7 +381,13 @@ class TargetFilter:
         self._current = cur
         hyst = TargetDecision(cur, self.scores[cur] if cur is not None else None)
 
-        return {"raw": TargetDecision(raw_pid, raw_conf), "ema": ema, "hyst": hyst}
+        return {
+            "raw": TargetDecision(raw_pid, raw_conf),
+            "ema": ema,
+            "hyst": hyst,
+            "ema_c": self._update_ema_c(evidence, seen),
+            "bayes": self._update_bayes(evidence, social_states, seen),
+        }
 
     def selected(self, decisions: dict[str, TargetDecision]) -> TargetDecision:
         return decisions[self.cfg.mode]
@@ -220,6 +405,7 @@ def chunk_record(
     *,
     source: str = "vlm",
     vlm_pid: int | None = None,
+    evidence: dict[int, float] | None = None,
 ) -> dict:
     """Entrada JSON-serializable por trozo: los votos (para `replay`) + lo
     que decidió cada modo. `target_probs`: P(t=1) por persona de los logits
@@ -234,6 +420,7 @@ def chunk_record(
         "source": source,
         "vlm_pid": vlm_pid if source == "rules" else raw_pid,
         "target_probs": {str(p): round(v, 4) for p, v in (target_probs or {}).items()},
+        "evidence": {str(p): round(v, 4) for p, v in (evidence or {}).items()},
         "social": {str(p): s for p, s in social_states.items()},
         "seen": sorted(seen_pids),
         **{
@@ -251,11 +438,12 @@ def replay(chunks: list[dict], cfg: TargetFilterConfig) -> list[dict]:
     for c in chunks:
         social = {int(p): s for p, s in c["social"].items()}
         seen = set(c["seen"])
-        decisions = tf.update(c["raw_pid"], c["raw_conf"], social, seen)
+        evidence = {int(p): v for p, v in c.get("evidence", {}).items()} or None
+        decisions = tf.update(c["raw_pid"], c["raw_conf"], social, seen, evidence)
         probs = {int(p): v for p, v in c.get("target_probs", {}).items()}
         out.append(chunk_record(
             c["chunk_index"], c["start_frame"], c["raw_pid"], c["raw_conf"], social, seen, decisions, probs,
-            source=c.get("source", "vlm"), vlm_pid=c.get("vlm_pid"),
+            source=c.get("source", "vlm"), vlm_pid=c.get("vlm_pid"), evidence=evidence,
         ))
     return out
 
@@ -286,7 +474,8 @@ def summarize(chunks: list[dict], cfg: TargetFilterConfig, chunk_sec: float) -> 
     return {
         "config": asdict(cfg),
         "metrics": {
-            mode: track_metrics([c[mode]["pid"] for c in chunks], chunk_sec) for mode in TARGET_FILTER_MODES
+            mode: track_metrics([c.get(mode, {}).get("pid") for c in chunks], chunk_sec)
+            for mode in TARGET_FILTER_MODES
         },
         "chunks": chunks,
     }
@@ -305,6 +494,8 @@ def _main() -> None:
     p.add_argument("--min-stable", type=int)
     p.add_argument("--absent-chunks", type=int)
     p.add_argument("--fallback-weight", type=float)
+    p.add_argument("--bayes-stay", type=float)
+    p.add_argument("--bayes-margin", type=float)
     args = p.parse_args()
 
     summary = json.loads(args.summary.read_text(encoding="utf-8"))
@@ -318,9 +509,9 @@ def _main() -> None:
     print(json.dumps(res["config"]))
     for mode, m in res["metrics"].items():
         print(f"  {mode:5s} {m}")
-    print("  trozo  raw   ema   hyst")
+    print("  trozo  " + " ".join(f"{m:5s}" for m in TARGET_FILTER_MODES))
     for c in chunks:
-        print(f"  {c['chunk_index']:5d}  {c['raw']['pid']!s:5s} {c['ema']['pid']!s:5s} {c['hyst']['pid']!s:5s}")
+        print(f"  {c['chunk_index']:5d}  " + " ".join(f"{c[m]['pid']!s:5s}" for m in TARGET_FILTER_MODES))
 
 
 if __name__ == "__main__":

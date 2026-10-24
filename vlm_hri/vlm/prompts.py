@@ -113,6 +113,12 @@ def _vlm_prompt_full(dets: list[dict], *, video: bool) -> str:
     )
 
 
+def vlm_prompt_person(*, video: bool = True) -> str:
+    """Prompt de una sola persona (la de la caja amarilla, ver
+    pose.gait.annotate_for_vlm_person)."""
+    return COMPACT["per_person"].format(clip="1s video" if video else "image")
+
+
 def vlm_prompt(dets: list[dict], *, video: bool = False) -> str:
     ordered = sort_dets_left_right([d for d in dets if "pid" in d])
     if not ordered:

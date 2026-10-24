@@ -13,6 +13,7 @@ comportamiento, para que el nodo ROS2 no tenga que duplicarla.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,14 +26,14 @@ import numpy as np
 
 from .. import video_io
 from ..clustering import cluster_by_distance
-from ..config import VLM_SAVE_INPUT, chunk_vlm_use_image
+from ..config import VLM_SAVE_INPUT, chunk_vlm_use_image, vlm_backend, vlm_query_mode
 from ..detection import dets_for_vlm_prompt
 from ..drawing import draw_banner_video, social_box_color, ui_scale
 from ..motion import strip_posture_prefix
 from ..pose import gait as pose_gait
 from ..social_state import SOCIAL_UNKNOWN
-from ..target_filter import TargetFilter, TargetFilterConfig, chunk_record
-from ..vlm.inference import VlmInferenceResult, infer_actions_image, infer_actions_video
+from ..target_filter import TargetFilter, TargetFilterConfig, chunk_record, target_evidence
+from ..vlm.inference import VlmInferenceResult, infer_actions_image, infer_actions_per_person, infer_actions_video
 
 _UNSET = object()  # distingue "target_pid no pasado" de "target_pid=None" (nadie elegible)
 
@@ -59,6 +60,9 @@ class PoseVlmChunkJob:
     out_path: Path
     fps: float
     size: tuple[int, int]
+    # Para el lag (cierre del trozo -> resultado del VLM): en tiempo real la
+    # cola (maxsize=8) acumula retraso si el VLM tarda más que un trozo.
+    submitted_at: float = field(default_factory=time.perf_counter)
 
 
 def _save_vlm_input(job: PoseVlmChunkJob, gait: dict[int, bool], moving_pids: set[int]) -> None:
@@ -160,6 +164,18 @@ class VideoFileSink:
         pass  # el CLI no necesita esto, solo el video
 
 
+def _draw_target_badge(img: np.ndarray, d: dict, conf: float | None) -> None:
+    """Distintivo "TARGET" sobre la persona elegida (dentro de la caja, arriba
+    a la derecha, para no chocar con la etiqueta de acción/intención)."""
+    txt = "TARGET" if conf is None else f"TARGET {conf:.2f}"
+    font, fs = cv2.FONT_HERSHEY_SIMPLEX, 0.6
+    (tw, th), bl = cv2.getTextSize(txt, font, fs, 2)
+    x2 = min(img.shape[1] - 2, int(d["x2"]) - 4)
+    x1, y1 = max(0, x2 - tw - 10), max(0, int(d["y1"]) + 6)
+    cv2.rectangle(img, (x1, y1), (x2, y1 + th + bl + 8), (0, 255, 255), -1)
+    cv2.putText(img, txt, (x1 + 5, y1 + th + 4), font, fs, (20, 20, 20), 2, cv2.LINE_AA)
+
+
 def render_pose_frame(
     rf: RawFrame,
     actions: dict[int, str],
@@ -208,10 +224,10 @@ def render_pose_frame(
         if draw_pose:
             pose_gait.draw_pose_skeleton(ann, d.get("kpts"))
         pose_txt = pose.get(d["pid"], "?")
-        act = strip_posture_prefix(actions.get(d["pid"], "idle"))
+        act = strip_posture_prefix(actions.get(d["pid"], "idle"), empty="-" if vlm_backend() == "vlm_jev" else "idle")
         state_txt = social_state or "UNKNOWN"
         pose_gait.draw_box_details(
-            ann, d["x1"], d["y1"], d["x2"], d["y2"], pose_txt, act, state_txt, color
+            ann, d["x1"], d["y1"], d["x2"], d["y2"], pose_txt, act, state_txt, color, pid=d["pid"]
         )
         text = f"{state_txt} | {pose_txt} | {act}"
         is_target = d["pid"] == target_pid
@@ -220,8 +236,9 @@ def render_pose_frame(
         if is_target:
             cv2.rectangle(
                 ann, (d["x1"] - 3, d["y1"] - 3), (d["x2"] + 3, d["y2"] + 3),
-                (0, 255, 255), 2,
+                (0, 255, 255), 4,
             )
+            _draw_target_badge(ann, d, target_confidence)
             wx, wy = d.get("world_x"), d.get("world_y")
             if wx is not None and wy is not None:
                 pose_gait.draw_target_coords(ann, d["x1"], d["y1"], float(wx), float(wy))
@@ -248,6 +265,48 @@ def render_pose_frame(
             cv2.FONT_HERSHEY_SIMPLEX, 0.5 * ui_scale(h, w), (255, 200, 255), 1, cv2.LINE_8,
         )
     return ann
+
+
+def _scaled_raw_frame(rf: RawFrame, factor: float) -> RawFrame:
+    """Agranda el frame Y las coordenadas de detecciones/keypoints por
+    `factor` ANTES de dibujar encima -- para la ventana --display (DISPLAY_SCALE)
+    y para limitar el video de salida (ver output_size).
+
+    Escalar la imagen ya dibujada (texto/cajas/esqueleto) con cv2.resize se ve
+    borroso: la interpolación difumina los bordes nítidos del texto y las
+    líneas finas. Escalando el frame crudo primero y dibujando después, cada
+    elemento se dibuja nítido directamente al tamaño final (ui_scale ya
+    calcula el grosor/tamaño de fuente a partir de las dimensiones de la
+    imagen, así que sale proporcionalmente más grande, no borroso)."""
+    if factor == 1.0:
+        return rf
+    frame = cv2.resize(rf.frame_bgr, None, fx=factor, fy=factor, interpolation=cv2.INTER_LINEAR)
+    dets: list[dict] = []
+    for d in rf.dets:
+        nd = dict(d)
+        for k in ("x1", "y1", "x2", "y2"):
+            nd[k] = int(round(d[k] * factor))
+        kpts = d.get("kpts")
+        if kpts is not None:
+            kpts = kpts.copy()
+            kpts[:, 0] *= factor
+            kpts[:, 1] *= factor
+            nd["kpts"] = kpts
+        dets.append(nd)
+    return RawFrame(rf.frame_i, frame, dets)
+
+
+# Lado mayor del video anotado para el usuario: con una cámara 4K, las
+# etiquetas (fuente fija) y las cajas de 2 px no se leían, y codificar 4K
+# es lento sin aportar nada a la visualización. Se reduce el frame crudo y
+# se dibuja después (nítido).
+VIDEO_OUT_MAX_SIDE = int(os.environ.get("VIDEO_OUT_MAX_SIDE", "1280"))
+
+
+def output_size(w: int, h: int) -> tuple[float, int, int]:
+    """(factor, ancho, alto) del video anotado de salida."""
+    f = min(1.0, VIDEO_OUT_MAX_SIDE / max(w, h))
+    return f, int(round(w * f)), int(round(h * f))
 
 
 def _collect_world_xy(raw_frames: list[RawFrame]) -> dict[int, tuple[float, float]]:
@@ -289,11 +348,12 @@ def _flush_chunk_to_sinks(job: PoseVlmChunkJob, session: "PoseStreamSession") ->
     world_xy = _collect_world_xy(job.raw_frames)
     clusters = cluster_by_distance(world_xy) if world_xy else None
     target_pid = None
+    f, out_w, out_h = output_size(session.w, session.h)
     for rf in job.raw_frames:
         target_pid = _target_in_frame(rf, vlm_target)
         ann = render_pose_frame(
-            rf, actions, social_states,
-            w=session.w, h=session.h, fps=session.fps, chunk_sec=session.chunk_sec,
+            _scaled_raw_frame(rf, f), actions, social_states,
+            w=out_w, h=out_h, fps=session.fps, chunk_sec=session.chunk_sec,
             chunk_index=job.chunk_index, chunk_count=chunk_count,
             yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
             pipeline_total_s=pipeline_now, vlm_pending=vlm_pending,
@@ -362,10 +422,32 @@ def _pose_vlm_worker(
         chunk_sec = len(vlm_frames) / max(job.fps, 1e-6)
         t0 = time.perf_counter()
         try:
-            if chunk_vlm_use_image(chunk_sec):
+            if vlm_backend() == "vlm_jev":
+                # `vlm`/`processor` = (JevEngine, policy), ver vlm.model.load_backend.
+                # Frames SIN anotar: JEV dibuja sus propias cajas P1..Pn.
+                from ..vlm.jev import infer_intention_jev
+
+                vlm_out = infer_intention_jev(
+                    vlm, processor, [(rf.frame_bgr, rf.dets) for rf in job.raw_frames], pids
+                )
+            elif vlm_query_mode() == "per_person" and not chunk_vlm_use_image(chunk_sec):
+                frames_by_pid = {}
+                for pid in pids:
+                    crop = pose_gait.person_crop_box(buffer_dets, pid, job.size)
+                    frames_by_pid[pid] = [
+                        pose_gait.annotate_for_vlm_person(rf.frame_bgr, rf.dets, pid, crop) for rf in job.raw_frames
+                    ]
+                if VLM_SAVE_INPUT:
+                    video_io.write_chunk_video(
+                        vlm_frames, job.out_path, job.fps, (vlm_frames[0].shape[1], vlm_frames[0].shape[0])
+                    )
+                vlm_out = infer_actions_per_person(vlm, processor, frames_by_pid, job.fps, chunk_sec=chunk_sec)
+            elif chunk_vlm_use_image(chunk_sec):
                 mid = vlm_frames[len(vlm_frames) // 2]
                 vlm_out = infer_actions_image(vlm, processor, mid, dets_prompt, already_annotated=True)
-            elif video_io.write_chunk_video(vlm_frames, job.out_path, job.fps, job.size):
+            elif video_io.write_chunk_video(
+                vlm_frames, job.out_path, job.fps, (vlm_frames[0].shape[1], vlm_frames[0].shape[0])
+            ):
                 vlm_out = infer_actions_video(
                     vlm, processor, job.out_path, pids, dets=dets_prompt, chunk_sec=chunk_sec
                 )
@@ -393,6 +475,9 @@ def _pose_vlm_worker(
                 acts, social, buffer_dets, pids, job.size, moving_pids_hint=moving_pids,
                 world_xy=world_xy or None, clusters=clusters,
             )
+            # También con JEV: medido 2026-10-21 (output/compare_backends),
+            # JEV dice ENGAGED al 56% -- un grupo posando de cara al robot
+            # sale ENGAGED entero; la mirada lo corrige igual que con Qwen2-VL.
             social = pose_gait.upgrade_attentive_by_gaze(social, buffer_dets, pids)
         else:
             pose = {}
@@ -414,12 +499,15 @@ def _pose_vlm_worker(
             raw_conf = None
         else:
             raw_pid, raw_conf = vlm_out.target_pid, vlm_out.target_confidence
-        decisions = target_filter.update(raw_pid, raw_conf, social, seen_pids)
+        # Voto continuo por persona para "ema_c"/"bayes": con JEV sale de
+        # sus probabilidades, con el VLM generativo de la tabla por estado.
+        evidence = target_evidence(social, vlm_out.social_probs, vlm_out.social_states)
+        decisions = target_filter.update(raw_pid, raw_conf, social, seen_pids, evidence)
         chosen = target_filter.selected(decisions)
         target_rec = chunk_record(
             job.chunk_index, job.start_frame, raw_pid, raw_conf,
             social, seen_pids, decisions, vlm_out.target_probs,
-            source=source, vlm_pid=vlm_out.target_pid,
+            source=source, vlm_pid=vlm_out.target_pid, evidence=evidence,
         )
 
         dt = time.perf_counter() - t0
@@ -445,7 +533,11 @@ def _pose_vlm_worker(
             state.segment_confidence.append((job.start_frame, dict(conf)))
             state.segment_interrupt_cost.append((job.start_frame, dict(cost)))
             state.vlm_chunk_timings.append(
-                {"chunk_index": job.chunk_index, "start_frame": job.start_frame, "latency_s": round(vlm_out.elapsed_s, 4)}
+                {
+                    "chunk_index": job.chunk_index, "start_frame": job.start_frame,
+                    "latency_s": round(vlm_out.elapsed_s, 4),
+                    "lag_s": round(time.perf_counter() - job.submitted_at, 4),
+                }
             )
             # Se sobrescribe siempre (también con None): en modo "raw", si el
             # VLM dice que en este trozo nadie es apto, el robot deja de tener
@@ -460,7 +552,8 @@ def _pose_vlm_worker(
             f"  [VLM trozo {job.chunk_index}] f{job.start_frame}+ actions={acts} social={social} "
             f"gait={sorted(moving_pids)} target[{source}]={raw_pid} vlm={vlm_out.target_pid} p={vlm_out.target_confidence} "
             f"P(t=1)={ {p: round(v, 2) for p, v in vlm_out.target_probs.items()} } "
-            f"[ema={decisions['ema'].pid} hyst={decisions['hyst'].pid} -> {target_filter.cfg.mode}={chosen.pid}] (inferencia {vlm_out.elapsed_s:.2f}s, acum VLM {state.vlm_total_s:.2f}s)",
+            f"[ema={decisions['ema'].pid} hyst={decisions['hyst'].pid} ema_c={decisions['ema_c'].pid} "
+            f"bayes={decisions['bayes'].pid} -> {target_filter.cfg.mode}={chosen.pid}] (inferencia {vlm_out.elapsed_s:.2f}s, acum VLM {state.vlm_total_s:.2f}s)",
             flush=True,
         )
 
@@ -546,15 +639,18 @@ class PoseStreamSession:
             vlm_acum = self.state.vlm_total_s
             vlm_n = self.state.vlm_calls
             vlm_pending = self.state.vlm_pending
+            pose = dict(self.state.pose)
+        f, out_w, out_h = output_size(self.w, self.h)
         return render_pose_frame(
-            rf, actions, social_states,
-            w=self.w, h=self.h, fps=self.fps, chunk_sec=self.chunk_sec,
+            _scaled_raw_frame(rf, f), actions, social_states,
+            w=out_w, h=out_h, fps=self.fps, chunk_sec=self.chunk_sec,
             chunk_index=self.chunk_i, chunk_count=max(self.chunk_i, vlm_n),
             target_pid=_target_in_frame(rf, vlm_target),
             target_confidence=vlm_target_conf,
             yolo_total_s=yolo_acum, vlm_total_s=vlm_acum, vlm_calls=vlm_n,
             pipeline_total_s=time.perf_counter() - self.t_pipeline0, vlm_pending=vlm_pending,
             draw_pose=self.draw_pose,
+            pose=pose,
         )
 
     def tick(self, elapsed_s: float = 0.0) -> None:

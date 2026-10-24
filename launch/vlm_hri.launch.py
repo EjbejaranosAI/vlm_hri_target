@@ -90,7 +90,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "target_filter",
                 default_value="",
-                description="Qué target va a /vlm_hri/target_pose: raw | ema | hyst. Vacío = el del YAML",
+                description="Qué target va a /vlm_hri/target_pose: raw | ema | hyst | ema_c | bayes. Vacío = el del YAML",
             ),
             OpaqueFunction(function=_launch_setup),
         ]

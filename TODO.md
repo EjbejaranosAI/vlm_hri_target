@@ -23,12 +23,13 @@ apagado). Ver `git diff` para el estado completo sin commitear.
   forma consistente (no solo en el arranque/warmup) — si es así, reforzar el
   prompt (`vlm_hri/vlm/prompt_templates/compact.json`, campo `'s'`) para que
   no admita palabras de postura ahí tampoco.
-- [ ] **Límite conocido y documentado (no atacado esta sesión):**
-  `vlm_hri/motion.py::chunk_motion_by_pid` puede confundir un balanceo lento
-  de pie (p. ej. hablando/sonriendo a cámara) con un paso lento real dentro
-  de un mismo trozo de 1s — ver docstring ahí mismo (`CHUNK_MOTION_DIRECTIONALITY`,
-  hoy en 0.35). Si reaparece `walking` falso con piernas SÍ visibles, tocar
-  ese umbral.
+- [x] ~~`chunk_motion_by_pid` confundía balanceo/jitter con caminar~~ —
+  recalibrado 2026-10-02 (avance neto + sin saltos de tracking, ver
+  docstring). Queda abierto: caminar HACIA la cámara apenas desplaza el
+  centro de la caja y las piernas suelen quedar fuera de cuadro
+  (empresarios.mp4: 1/30 trozos detectados como MOVING) — haría falta una
+  señal de crecimiento de caja calibrada (`chunk_depth_motion_by_pid` sigue
+  experimental).
 - [ ] **Decidir si el resto del WIP se commitea.** El working tree tiene
   cambios grandes sin commitear (confidence/interrupt_cost, TargetStability,
   fps_calibration en el nodo ROS, `/vlm_hri/pose_skeleton`, etc.) — revisar

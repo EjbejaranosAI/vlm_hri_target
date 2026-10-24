@@ -60,6 +60,8 @@ class VlmInferenceResult(NamedTuple):
     # target_flag_probabilities) -- también para las que el VLM marcó con 0.
     # Vacío con el formato viejo "target": <ID> o en batch (sin scores).
     target_probs: dict[int, float] = {}
+    # {pid: {estado: P}} -- solo con VLM_BACKEND=vlm_jev (ver vlm/jev.py).
+    social_probs: dict[int, dict[str, float]] = {}
 
 
 def actions_for_ids(actions: dict[int, str], person_ids: list[int]) -> dict[int, str]:
@@ -544,6 +546,80 @@ def infer_actions_video_batch(
             infer_actions_video(model, processor, vp, pids, dets=dets, chunk_sec=chunk_sec)
             for vp, pids, dets in items
         ]
+
+
+_PER_PERSON_MAX_NEW = 32  # {"a":"<3-6 palabras>","s":"ENGAGED"} ~ 20-25 tokens
+
+
+def infer_actions_per_person(
+    model,
+    processor,
+    frames_by_pid: dict[int, list[np.ndarray]],
+    fps: float,
+    *,
+    chunk_sec: float | None = None,
+) -> VlmInferenceResult:
+    """VLM_QUERY_MODE=per_person: una consulta por persona (clip BGR con solo
+    su caja resaltada, ver pose.gait.annotate_for_vlm_person), todas en una
+    sola llamada a generate(). Con el prompt de grupo, Qwen2-VL-2B tendía a
+    copiar la misma etiqueta a todas las personas del trozo."""
+    from .prompts import vlm_prompt_person
+
+    pids = list(frames_by_pid)
+    if not pids:
+        return VlmInferenceResult({}, {}, 0.0)
+    vfps = video_vlm_fps(chunk_sec if chunk_sec is not None else 1.0)
+    batch_messages = []
+    for pid in pids:
+        frames = frames_by_pid[pid]
+        n = len(frames)
+        k = max(1, min(n, round(n / max(fps, 1e-6) * vfps)))
+        idx = np.linspace(0, n - 1, k).round().astype(int)
+        pil = [Image.fromarray(cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)) for i in idx]
+        batch_messages.append([{
+            "role": "user",
+            "content": [
+                {"type": "video", "video": pil, "max_pixels": VLM_VIDEO_MAX_PIXELS},
+                {"type": "text", "text": vlm_prompt_person(video=True)},
+            ],
+        }])
+    dev = next(model.parameters()).device
+    chats = [
+        processor.apply_chat_template(
+            m + [{"role": "assistant", "content": "{"}],
+            tokenize=False, add_generation_prompt=False, continue_final_message=True,
+        )
+        for m in batch_messages
+    ]
+    videos: list = []
+    for m in batch_messages:
+        _, vids = process_vision_info(m) if process_vision_info else (None, None)
+        videos.extend(vids or [])
+    # Generación en batch: el relleno debe ir a la IZQUIERDA para que todas
+    # las secuencias terminen donde empieza lo generado.
+    side = processor.tokenizer.padding_side
+    processor.tokenizer.padding_side = "left"
+    t0 = time.perf_counter()
+    try:
+        inputs = processor(text=chats, images=None, videos=videos, padding=True, return_tensors="pt").to(dev)
+        with torch.inference_mode():
+            out = model.generate(**inputs, max_new_tokens=_PER_PERSON_MAX_NEW, do_sample=False, use_cache=True)
+    finally:
+        processor.tokenizer.padding_side = side
+    raws = processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    elapsed = time.perf_counter() - t0
+    actions: dict[int, str] = {}
+    social: dict[int, str] = {}
+    for pid, raw in zip(pids, raws):
+        raw = "{" + raw.lstrip("{").strip()
+        a, s, _, _ = parse_vlm_response(raw, [pid])
+        a, s = coerce_action_social(a[pid], s[pid])
+        actions[pid], social[pid] = prioritize_movement_action(a), s
+        if VLM_DEBUG:
+            print(f"  VLM raw [ID{pid}]: {raw!r}", flush=True)
+    if VLM_DEBUG:
+        print(f"  VLM por persona {pids} → actions={actions} social={social} ({elapsed:.2f}s)", flush=True)
+    return VlmInferenceResult(actions, social, elapsed)
 
 
 def warmup_vlm(model, processor) -> None:

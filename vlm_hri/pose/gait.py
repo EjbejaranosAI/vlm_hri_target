@@ -28,6 +28,7 @@ from ..clustering import same_cluster
 from ..social_state import (
     SOCIAL_ATTENTIVE,
     SOCIAL_AVAILABLE,
+    SOCIAL_BUSY,
     SOCIAL_ENGAGED,
     SOCIAL_MOVING,
     SOCIAL_UNKNOWN,
@@ -216,15 +217,29 @@ def attach_pose_keypoints(tracked_dets: list[dict], pose_dets: list[dict]) -> No
     yolo11n quedaba partida en 3-4 IDs distintos con el detector de pose. Se
     mantiene el tracking probado y estable, y la pose solo aporta keypoints
     encima de esas cajas ya trackeadas.
+
+    Emparejamiento 1 a 1 (voraz por IoU descendente): antes cada pose
+    elegía su mejor caja por separado, y con dos personas pegadas las dos
+    poses podían ir a la MISMA caja (la segunda pisaba a la primera) -- la
+    otra persona se quedaba sin keypoints o con los de su vecino, y la
+    mirada/espalda de uno se le aplicaba al otro.
     """
-    for pd_ in pose_dets:
-        best, best_iou = None, 0.0
-        for td in tracked_dets:
+    pairs = []
+    for i, pd_ in enumerate(pose_dets):
+        if "kpts" not in pd_:
+            continue
+        for j, td in enumerate(tracked_dets):
             iou = box_iou(pd_, td)
-            if iou > best_iou:
-                best_iou, best = iou, td
-        if best is not None and best_iou >= POSE_MATCH_MIN_IOU and "kpts" in pd_:
-            best["kpts"] = pd_["kpts"]
+            if iou >= POSE_MATCH_MIN_IOU:
+                pairs.append((iou, i, j))
+    used_p: set[int] = set()
+    used_t: set[int] = set()
+    for _, i, j in sorted(pairs, reverse=True):
+        if i in used_p or j in used_t:
+            continue
+        used_p.add(i)
+        used_t.add(j)
+        tracked_dets[j]["kpts"] = pose_dets[i]["kpts"]
 
 
 def _knee_angle(kpts: np.ndarray, hip_i: int, knee_i: int, ankle_i: int) -> float | None:
@@ -776,6 +791,7 @@ def draw_box_details(
     x1: int, y1: int, x2: int, y2: int,
     pose_txt: str, action_txt: str, social_txt: str,
     color: tuple[int, int, int],
+    pid: int | None = None,
 ) -> None:
     """Segunda etiqueta pegada a la caja (bajo ella si hay sitio, si no
     encima) con postura/acción/intención por separado -- ID + color de caja
@@ -783,6 +799,8 @@ def draw_box_details(
     todos juntos en el panel lateral (una lista aparte); esto los pone
     también encima de cada bbox para verlos sin mirar la lista."""
     label = f"{pose_txt} | {action_txt} | {social_txt}"
+    if pid is not None:  # la etiqueta tapaba la del ID de draw_box_only
+        label = f"ID{pid} | {label}"
     font = cv2.FONT_HERSHEY_SIMPLEX
     fs = 0.45
     (tw, th), baseline = cv2.getTextSize(label, font, fs, 1)
@@ -879,6 +897,11 @@ def draw_side_panel(
         cy += bl + line_gap
 
 
+# Lado mayor del frame que se anota para el VLM (~lo que deja
+# VLM_VIDEO_MAX_PIXELS=384 parches de 28x28 en 16:9).
+VLM_ANNOT_MAX_SIDE = int(os.environ.get("VLM_ANNOT_MAX_SIDE", "768"))
+
+
 def annotate_for_vlm_pose(
     frame_bgr: np.ndarray, dets: list[dict], moving_pids: set[int]
 ) -> np.ndarray:
@@ -886,13 +909,91 @@ def annotate_for_vlm_pose(
     movimiento) / roja (parado), solo con el ID (sin texto de estado) — el
     color YA es la pista de movimiento. Con VLM_MOTION_HINT=0, todas
     amarillas (sin pista)."""
-    out = frame_bgr.copy()
+    # Se reduce ANTES de dibujar: el procesador de Qwen2-VL reescala el clip a
+    # ~VLM_VIDEO_MAX_PIXELS, y con una cámara 4K eso es ~5x por lado -- la
+    # caja de 1 px y la etiqueta "ID1" (fuente 0.4) quedaban ilegibles y el
+    # VLM no podía saber qué persona era cuál (medido en watching_robot.mp4).
+    h, w = frame_bgr.shape[:2]
+    scale = min(1.0, VLM_ANNOT_MAX_SIDE / max(h, w))
+    out = cv2.resize(frame_bgr, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame_bgr.copy()
     hint = vlm_motion_hint()
     for d in sort_dets_left_right(dets):
+        kpts = d.get("kpts")
+        if kpts is not None and scale < 1.0:
+            kpts = kpts * np.array([scale, scale, 1.0])
         draw_thin_pose_box(
-            out, d["x1"], d["y1"], d["x2"], d["y2"], pid_label(d["pid"]),
-            d.get("kpts"), moving=(d["pid"] in moving_pids) if hint else None,
+            out, *(int(round(d[k] * scale)) for k in ("x1", "y1", "x2", "y2")), pid_label(d["pid"]),
+            kpts, moving=(d["pid"] in moving_pids) if hint else None,
         )
+    return out
+
+
+COLOR_PERSON_HIGHLIGHT_BGR = (0, 255, 255)  # amarillo: la persona consultada
+
+
+# Recorte por persona (VLM_QUERY_MODE=per_person): el frame entero reducido a
+# ~384 parches deja a cada persona en pocos parches, y con dos cajas pegadas
+# el VLM (2B) describía la escena y no a la persona resaltada -- las dos
+# salían con la misma intención. Se recorta la unión de sus cajas del trozo
+# (fija en todo el clip, para que se vea el movimiento) con un margen de
+# contexto, y se agranda hasta VLM_ANNOT_MAX_SIDE. VLM_PERSON_CROP=0 vuelve
+# al frame completo.
+VLM_PERSON_CROP = os.environ.get("VLM_PERSON_CROP", "1") == "1"
+VLM_PERSON_CROP_MARGIN = float(os.environ.get("VLM_PERSON_CROP_MARGIN", "0.5"))
+
+
+def person_crop_box(
+    buffer_dets: list[list[dict]], pid: int, frame_size: tuple[int, int]
+) -> tuple[int, int, int, int] | None:
+    """Unión de las cajas de `pid` en el trozo + margen (VLM_PERSON_CROP_MARGIN
+    del ancho a cada lado, la mitad de eso del alto), recortada al frame.
+    None si el recorte está desactivado o el pid no aparece."""
+    if not VLM_PERSON_CROP:
+        return None
+    boxes = [d for row in buffer_dets for d in row if d.get("pid") == pid]
+    if not boxes:
+        return None
+    w, h = frame_size
+    x1, y1 = min(d["x1"] for d in boxes), min(d["y1"] for d in boxes)
+    x2, y2 = max(d["x2"] for d in boxes), max(d["y2"] for d in boxes)
+    mx = VLM_PERSON_CROP_MARGIN * (x2 - x1)
+    my = 0.5 * VLM_PERSON_CROP_MARGIN * (y2 - y1)
+    return (
+        max(0, int(x1 - mx)), max(0, int(y1 - my)),
+        min(w, int(x2 + mx)), min(h, int(y2 + my)),
+    )
+
+
+def annotate_for_vlm_person(
+    frame_bgr: np.ndarray, dets: list[dict], pid: int,
+    crop: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
+    """Frame para la consulta de UNA persona (VLM_QUERY_MODE=per_person): sin
+    las demás cajas, solo la de `pid`, gruesa y amarilla. Con `crop` (ver
+    person_crop_box) se recorta esa región y se lleva a VLM_ANNOT_MAX_SIDE
+    (agrandando si hace falta); sin él, frame completo reducido a
+    VLM_ANNOT_MAX_SIDE antes de dibujar, igual que annotate_for_vlm_pose."""
+    ox, oy = 0, 0
+    if crop is not None and crop[2] > crop[0] and crop[3] > crop[1]:
+        ox, oy = crop[0], crop[1]
+        frame_bgr = frame_bgr[crop[1]:crop[3], crop[0]:crop[2]]
+        h, w = frame_bgr.shape[:2]
+        scale = VLM_ANNOT_MAX_SIDE / max(h, w)
+    else:
+        h, w = frame_bgr.shape[:2]
+        scale = min(1.0, VLM_ANNOT_MAX_SIDE / max(h, w))
+    if scale != 1.0:
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        out = cv2.resize(frame_bgr, (round(w * scale), round(h * scale)), interpolation=interp)
+    else:
+        out = frame_bgr.copy()
+    d = next((x for x in dets if x["pid"] == pid), None)
+    if d is not None:
+        x1, y1, x2, y2 = (
+            int(round((d[k] - o) * scale))
+            for k, o in (("x1", ox), ("y1", oy), ("x2", ox), ("y2", oy))
+        )
+        cv2.rectangle(out, (x1, y1), (x2, y2), COLOR_PERSON_HIGHLIGHT_BGR, 3)
     return out
 
 
@@ -967,6 +1068,44 @@ def chunk_facing_camera_by_pid(
             out[pid] = True
         elif ratio <= FACING_FALSE_RATIO:
             out[pid] = False
+    return out
+
+
+# De espaldas: hombros bien visibles pero sin cara (nariz y ambos ojos bajo
+# FACE_CONF_MIN). Un perfil sigue dejando ver la nariz con confianza alta, así
+# que no entra aquí. Antes nada en el pipeline marcaba BUSY a alguien de
+# espaldas: el VLM (2B) casi nunca lo hacía pese al prompt, y
+# upgrade_attentive_by_gaze solo bajaba ATTENTIVE -> AVAILABLE (elegible).
+BACK_SHOULDER_CONF_MIN = 0.5
+BACK_TRUE_RATIO = 0.6
+
+
+def is_back_to_camera(kpts: np.ndarray) -> bool:
+    if kpts[L_SHOULDER][2] < BACK_SHOULDER_CONF_MIN or kpts[R_SHOULDER][2] < BACK_SHOULDER_CONF_MIN:
+        return False
+    return bool(
+        kpts[NOSE][2] < FACE_CONF_MIN
+        and kpts[L_EYE][2] < FACE_CONF_MIN
+        and kpts[R_EYE][2] < FACE_CONF_MIN
+    )
+
+
+def chunk_back_to_camera_by_pid(
+    buffer_dets: list[list[dict]], person_ids: list[int]
+) -> set[int]:
+    """Pids de espaldas a la cámara en al menos BACK_TRUE_RATIO de los frames
+    del trozo con pose (mínimo FACING_MIN_SEEN frames con keypoints)."""
+    out: set[int] = set()
+    for pid in person_ids:
+        seen = back = 0
+        for row in buffer_dets:
+            for d in row:
+                if d.get("pid") == pid and "kpts" in d:
+                    seen += 1
+                    back += is_back_to_camera(d["kpts"])
+                    break
+        if seen >= FACING_MIN_SEEN and back / seen >= BACK_TRUE_RATIO:
+            out.add(pid)
     return out
 
 
@@ -1162,8 +1301,13 @@ def refine_labels_pose(
         chunk_motion_by_pid(compensated, person_ids, frame_size).keys()
     )
     confirmed_moving = moving_pids_confirmed | bbox_confirmed
+    dbg = os.environ.get("REFINE_DEBUG", "0") == "1"
+    if dbg:
+        print(f"    refine: vlm={social} gait={sorted(moving_pids_confirmed)} bbox={sorted(bbox_confirmed)} legs={legs_visible}", flush=True)
     actions, social = debias_group_walking(actions, social, person_ids, confirmed_moving)
     actions, social = require_moving_evidence(actions, social, confirmed_moving)
+    if dbg:
+        print(f"    refine: tras debias/evidencia={social}", flush=True)
 
     # Postura ("sitting"/"standing"/"walking") ya no la juzga el VLM en
     # absoluto (prompt actualizado: solo describe la actividad específica) --
@@ -1193,12 +1337,24 @@ def refine_labels_pose(
         moving_pids=set(), legs_visible=legs_visible,
         posture_hint=posture_hint,
     )
+    if dbg:
+        print(f"    refine: tras refine_chunk_labels={social} acts={actions}", flush=True)
     social = check_engaged_proximity(actions, social, person_ids, world_xy, clusters)
     return actions, social, posture_hint
 
 
+# Desde qué estados del VLM promueve la mirada sostenida a la cámara.
+# Medido 2026-10-02 (6 videos, 268 etiquetas a ojo, VLM_QUERY_MODE=
+# per_person): Qwen2-VL-2B casi nunca dice ATTENTIVE y confunde "sonríe
+# mirando a la cámara" con "habla" (ENGAGED) -- con solo AVAILABLE se acertaba
+# el 59%, añadiendo ENGAGED el 69% (elegibilidad 58% -> 74%); añadir BUSY
+# empeoraba (66%: alguien leyendo con la cara de frente no está mirando).
+# Coste: alguien que habla con otro pero de cara a la cámara pasa a ATTENTIVE.
+_GAZE_PROMOTE_FROM = {SOCIAL_AVAILABLE, SOCIAL_ENGAGED}
+
+
 def upgrade_attentive_by_gaze(
-    social: dict[int, str], buffer_dets: list[list[dict]], person_ids: list[int]
+    social: dict[int, str], buffer_dets: list[list[dict]], person_ids: list[int], *, promote: bool = True
 ) -> dict[int, str]:
     """Ajusta ATTENTIVE con la mirada real (pose, ver is_facing_camera —
     ahora geométrico: nariz centrada entre ojos, no solo "puntos visibles"),
@@ -1207,30 +1363,36 @@ def upgrade_attentive_by_gaze(
       frente la mayoría del trozo — ya sea porque confirma que mira a otro
       lado, o porque no hay suficientes datos de pose ese trozo para saberlo
       (modo rígido, default: sin datos = no se acepta el ATTENTIVE del VLM).
-    - PROMOCIONAR: AVAILABLE → ATTENTIVE si la pose SÍ confirma mirada
-      centrada la mayoría del trozo. Solo se promueve desde AVAILABLE, nunca
-      desde BUSY/ENGAGED/MOVING (esos ya son un juicio más específico del
-      VLM sobre una actividad concreta que no se debe pisar) — que el estado
-      ya sea AVAILABLE significa que la acción en sí no era "algo crucial"
-      (nada de hablar/teléfono/leer/caminar detectado), así que ahí sí basta
-      con mirada centrada sostenida como evidencia de intención de
-      interactuar. (Antes esta función solo desmentía, nunca promovía, para
-      evitar que cualquiera de pie por casualidad frente al robot contara
-      como ATTENTIVE sin más contexto — la promoción ahora exige que el
-      resto de la escena YA esté en el estado más neutro posible.)
+    - PROMOCIONAR: AVAILABLE/ENGAGED → ATTENTIVE si la pose SÍ confirma
+      mirada centrada la mayoría del trozo (ver _GAZE_PROMOTE_FROM: el VLM
+      casi nunca dice ATTENTIVE y confunde sonreír a la cámara con hablar).
+      Nunca desde BUSY/MOVING: leer/usar el móvil de cara a la cámara no es
+      mirarla, y moverse lo decide la marcha.
+    - DE ESPALDAS: AVAILABLE/ATTENTIVE → BUSY si la pose muestra hombros sin
+      cara la mayoría del trozo (ver is_back_to_camera). MOVING/ENGAGED se
+      respetan (alejarse caminando o hablar con otro de espaldas al robot ya
+      son estados no elegibles). Desactivable con BACK_TURNED_BUSY=0.
     Desactivable con STRICT_ATTENTIVE_GAZE=0: en ese modo, sin datos de pose
     no desmiente un ATTENTIVE existente, pero la promoción SIEMPRE exige
-    evidencia positiva de mirada (eso no es configurable)."""
+    evidencia positiva de mirada (eso no es configurable).
+    `promote=False` apaga solo la promoción; degradar y de espaldas se
+    aplican igual."""
     facing = chunk_facing_camera_by_pid(buffer_dets, person_ids)
+    back = (
+        chunk_back_to_camera_by_pid(buffer_dets, person_ids)
+        if os.environ.get("BACK_TURNED_BUSY", "1") == "1" else set()
+    )
     strict = os.environ.get("STRICT_ATTENTIVE_GAZE", "1") == "1"
     out = dict(social)
     for pid in person_ids:
         cur = out.get(pid)
         is_facing = facing.get(pid)
-        if cur == SOCIAL_ATTENTIVE and (
+        if pid in back and cur in (SOCIAL_AVAILABLE, SOCIAL_ATTENTIVE):
+            out[pid] = SOCIAL_BUSY
+        elif cur == SOCIAL_ATTENTIVE and (
             is_facing is False or (strict and is_facing is None)
         ):
             out[pid] = SOCIAL_AVAILABLE
-        elif cur == SOCIAL_AVAILABLE and is_facing is True:
+        elif promote and cur in _GAZE_PROMOTE_FROM and is_facing is True:
             out[pid] = SOCIAL_ATTENTIVE
     return out

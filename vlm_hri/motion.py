@@ -38,30 +38,24 @@ def chunk_motion_by_pid(
     como asumían los umbrales anteriores, que exigían ~0.14·alto por frame y
     nunca se cumplían — por eso "walking" casi nunca se detectaba por
     cinemática y la gente en movimiento quedaba como AVAILABLE). Aquí solo se
-    exige desplazamiento total del trozo (relativo al alto de la caja) y
-    direccionalidad neta/recorrido para filtrar el zigzag de tracking de
-    alguien parado.
+    exige avance neto del trozo (relativo al alto de la caja) sin saltos
+    bruscos entre frames (ver la recalibración más abajo).
     """
     if not buffer_dets or not person_ids:
         return {}
     total_floor_px = float(os.environ.get("CHUNK_MOTION_PX", "6"))
-    rel_total = float(os.environ.get("CHUNK_MOTION_TOTAL_REL", "0.06"))
-    # Persona parada con jitter de tracking (re-detección, cambio de postura,
-    # oclusión parcial) acumula desplazamiento en zigzag: mucho "path" pero
-    # poco avance neto. Caminar de verdad es direccional: el desplazamiento
-    # neto (inicio→fin) se acerca al camino recorrido.
-    #
-    # Límite conocido (medido, no solo teórico): un balanceo de peso MUY lento
-    # de pie (p. ej. alguien hablando/sonriendo a cámara) puede verse igual de
-    # "direccional" que caminar si su período de vaivén es más largo que el
-    # propio clip — solo se observa un tramo de la oscilación, nunca el
-    # regreso. Subir este umbral NO lo arregla (se probó empíricamente: subirlo
-    # perdía caminatas reales sin quitar ese falso positivo, porque el vaivén
-    # medido llegaba a la misma direccionalidad que un paso lento real).
-    # Arreglarlo de raíz requiere una ventana temporal más larga que un trozo
-    # (para ver si la persona vuelve cerca de su posición de origen) o una
-    # señal distinta a la posición del centro de la caja (p. ej. pose/marcha).
-    min_directionality = float(os.environ.get("CHUNK_MOTION_DIRECTIONALITY", "0.35"))
+    # Recalibrado 2026-10-02 (series de caja de los 5 videos de input_videos/,
+    # compensadas por cámara, etiquetadas a ojo): el criterio anterior
+    # (recorrido acumulado >= 6% del alto + direccionalidad >= 0.35) daba
+    # falso positivo en 49/246 trozos de gente quieta -- el recorrido suma el
+    # jitter de la caja en multitudes/oclusiones, y los peores casos eran
+    # SALTOS DE ID del tracker dentro del trozo (desplazamientos de 1-2.4
+    # veces el alto en un frame). Ahora: avance NETO >= 8% del alto y ningún
+    # salto entre frames > 8% del alto (caminar avanza ~1-3 px por frame,
+    # suave). 0/246 falsos positivos, 3/5 trozos de caminata real (de los 2
+    # perdidos, uno era justo un salto de ID).
+    net_rel = float(os.environ.get("CHUNK_MOTION_NET_REL", "0.08"))
+    max_step_rel = float(os.environ.get("CHUNK_MOTION_MAX_STEP_REL", "0.08"))
     out: dict[int, str] = {}
     for pid in person_ids:
         pts: list[tuple[float, float]] = []
@@ -76,18 +70,17 @@ def chunk_motion_by_pid(
                     break
         if len(pts) < 4:
             continue
-        dist = 0.0
-        for i in range(1, len(pts)):
-            dx = pts[i][0] - pts[i - 1][0]
-            dy = pts[i][1] - pts[i - 1][1]
-            dist += (dx * dx + dy * dy) ** 0.5
         avg_h = sum(heights) / len(heights) if heights else 80.0
-        total_thr = max(total_floor_px, rel_total * avg_h)
+        max_step = max(
+            ((pts[i][0] - pts[i - 1][0]) ** 2 + (pts[i][1] - pts[i - 1][1]) ** 2) ** 0.5
+            for i in range(1, len(pts))
+        )
+        if max_step > max_step_rel * avg_h:
+            continue  # salto de tracking, no movimiento: no se puede confiar en este trozo
         net_dx = pts[-1][0] - pts[0][0]
         net_dy = pts[-1][1] - pts[0][1]
         net_disp = (net_dx * net_dx + net_dy * net_dy) ** 0.5
-        directionality = net_disp / dist if dist > 1e-6 else 0.0
-        if dist >= total_thr and directionality >= min_directionality:
+        if net_disp >= max(total_floor_px, net_rel * avg_h):
             out[pid] = "walking"
     return out
 
@@ -256,14 +249,16 @@ _POSTURE_PREFIX_RE = re.compile(
 _NO_ACTIVITY = {"unknown", "idle", ""}
 
 
-def strip_posture_prefix(action: str) -> str:
+def strip_posture_prefix(action: str, *, empty: str = "idle") -> str:
     """Quita el prefijo de postura ('sitting and ', 'standing', 'walking'...)
     de una acción ya combinada (ver enrich_action_posture), dejando solo la
-    actividad específica -- o "idle" si no queda nada (la acción ERA solo
+    actividad específica -- o `empty` si no queda nada (la acción ERA solo
     postura). Se usa para reportar 'action' y 'pose' como campos separados
-    en la salida (ROS/JSON), en vez de un único texto humano combinado."""
+    en la salida (ROS/JSON), en vez de un único texto humano combinado.
+    Con VLM_BACKEND=vlm_jev no hay acción del modelo: "idle" sería inventado,
+    los llamadores pasan otro `empty` ("-" / "unknown")."""
     rest = _POSTURE_PREFIX_RE.sub("", action or "").strip()
-    return rest if rest and rest.lower() not in _NO_ACTIVITY else "idle"
+    return rest if rest and rest.lower() not in _NO_ACTIVITY else empty
 
 
 def enrich_action_posture(

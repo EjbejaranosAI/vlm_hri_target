@@ -40,6 +40,7 @@ from ..config import (
     YOLO_WEIGHTS,
     chunk_vlm_use_image,
     video_vlm_fps,
+    vlm_backend,
     vlm_prompt_mode,
 )
 from ..detection import (
@@ -56,7 +57,7 @@ from ..pose import gait as pose_gait
 from ..social_state import SOCIAL_UNKNOWN, social_state_mode, social_states_from_actions
 from .. import target_filter as tfilter
 from ..vlm.inference import VlmInferenceResult, infer_actions_image, infer_actions_video, warmup_vlm
-from ..vlm.model import load_vlm
+from ..vlm.model import backend_model_id, load_backend, load_vlm
 
 ROOT = ROOT
 _STREAM_OUTPUT_DIR_PLAIN = Path(os.environ.get("STREAM_OUTPUT_DIR", str(ROOT / "output_stream")))
@@ -758,35 +759,7 @@ def _run_all_plain(
 
 
 
-from .pose_session import PoseStreamSession, RawFrame, VideoFileSink, render_pose_frame
-
-
-def _scaled_raw_frame(rf: RawFrame, factor: float) -> RawFrame:
-    """Agranda el frame Y las coordenadas de detecciones/keypoints por
-    `factor` ANTES de dibujar encima -- para la ventana --display (DISPLAY_SCALE).
-
-    Escalar la imagen ya dibujada (texto/cajas/esqueleto) con cv2.resize se ve
-    borroso: la interpolación difumina los bordes nítidos del texto y las
-    líneas finas. Escalando el frame crudo primero y dibujando después, cada
-    elemento se dibuja nítido directamente al tamaño final (ui_scale ya
-    calcula el grosor/tamaño de fuente a partir de las dimensiones de la
-    imagen, así que sale proporcionalmente más grande, no borroso)."""
-    if factor == 1.0:
-        return rf
-    frame = cv2.resize(rf.frame_bgr, None, fx=factor, fy=factor, interpolation=cv2.INTER_LINEAR)
-    dets: list[dict] = []
-    for d in rf.dets:
-        nd = dict(d)
-        for k in ("x1", "y1", "x2", "y2"):
-            nd[k] = int(round(d[k] * factor))
-        kpts = d.get("kpts")
-        if kpts is not None:
-            kpts = kpts.copy()
-            kpts[:, 0] *= factor
-            kpts[:, 1] *= factor
-            nd["kpts"] = kpts
-        dets.append(nd)
-    return RawFrame(rf.frame_i, frame, dets)
+from .pose_session import PoseStreamSession, RawFrame, VideoFileSink, _scaled_raw_frame, output_size, render_pose_frame
 
 
 def _run_pose(
@@ -854,15 +827,14 @@ def _run_pose(
     warmup_yolo(yolo, shape=(h, w, 3))
     warmup_yolo(yolo_pose, shape=(h, w, 3))
     if vlm is None or processor is None:
-        print("Cargando VLM …", flush=True)
+        print(f"Cargando VLM [{vlm_backend()}] {backend_model_id()} …", flush=True)
         t_load = time.perf_counter()
-        vlm, processor = load_vlm(VLM_ID, device)
-        if VLM_WARMUP:
-            warmup_vlm(vlm, processor)
+        vlm, processor = load_backend(device, warmup=VLM_WARMUP)
         print(f"  VLM listo en {time.perf_counter() - t_load:.1f}s", flush=True)
 
     out_mp4 = out / "annotated_stream.mp4"
-    writer = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    _, out_w, out_h = output_size(w, h)
+    writer = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
     video_sink = VideoFileSink(writer=writer, lock=threading.Lock())
     session = PoseStreamSession(
         w=w, h=h, fps=fps, chunk_sec=chunk_sec, chunk_dir=chunk_dir,

@@ -36,13 +36,12 @@ from sensor_msgs.msg import CompressedImage, Image
 from ultralytics import YOLO
 from vision_msgs.msg import Detection2DArray
 
-from ..config import POSE_YOLO_WEIGHTS, VIDEO_VLM_CHUNK_SEC, VLM_ID, VLM_WARMUP, YOLO_WEIGHTS
+from ..config import POSE_YOLO_WEIGHTS, VIDEO_VLM_CHUNK_SEC, VLM_WARMUP, YOLO_WEIGHTS, vlm_backend
 from ..detection import assign_spatial_ids, detect_people, resolve_device, track_detections, warmup_yolo
 from ..pose import gait as pose_gait
 from ..runners.pose_session import PoseStreamSession
 from ..target_filter import TargetFilterConfig
-from ..vlm.inference import warmup_vlm
-from ..vlm.model import load_vlm
+from ..vlm.model import backend_model_id, load_backend
 from .detections_bridge import detection2d_array_to_dets
 from .sink import RosPublisherSink
 
@@ -110,6 +109,11 @@ class VlmHriNode(Node):
         self._chunk_dir = Path(str(self.get_parameter("chunk_dir").value))
         self._target_filter = TargetFilterConfig(
             mode=str(self.get_parameter("target_filter").value).strip().lower(),
+            # Sin esto el nodo votaba siempre con "rules" aunque
+            # VLM_TARGET_SOURCE=vlm (que sí cambia el prompt, ver config).
+            source=tf_default.source,
+            bayes_stay=tf_default.bayes_stay,
+            bayes_margin=tf_default.bayes_margin,
             alpha=float(self.get_parameter("target_ema_alpha").value),
             enter_threshold=float(self.get_parameter("target_enter_threshold").value),
             exit_threshold=float(self.get_parameter("target_exit_threshold").value),
@@ -130,10 +134,8 @@ class VlmHriNode(Node):
         if self._use_pose:
             self.get_logger().info("Cargando YOLO-pose …")
             self._yolo_pose = YOLO(POSE_YOLO_WEIGHTS)
-        self.get_logger().info("Cargando VLM …")
-        self._vlm, self._processor = load_vlm(VLM_ID, self._device)
-        if VLM_WARMUP:
-            warmup_vlm(self._vlm, self._processor)
+        self.get_logger().info(f"Cargando VLM [{vlm_backend()}] {backend_model_id()} …")
+        self._vlm, self._processor = load_backend(self._device, warmup=VLM_WARMUP)
         self.get_logger().info("VLM listo")
 
         self._session: PoseStreamSession | None = None

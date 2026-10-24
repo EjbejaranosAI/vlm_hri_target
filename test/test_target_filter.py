@@ -182,3 +182,93 @@ def test_ema_fallback_only_tie_goes_to_nobody():
     tf = TargetFilter(TargetFilterConfig(mode="ema"))
     out = _run(tf, [(None, None)] * 30, social={2: SOCIAL_ATTENTIVE}, seen={2})
     assert {d["ema"].pid for d in out} == {None}
+
+
+def test_hyst_same_tier_tiebreak_flipping_does_not_block_target():
+    # Medido en watching_robot_2.mp4: 5 personas ATTENTIVE con cajas
+    # parecidas, el desempate por caja cambiaba de ganador cada trozo y la
+    # histéresis no fijaba target en 14 trozos.
+    at = SOCIAL_ATTENTIVE
+    social = {p: at for p in range(1, 6)}
+    tf = TargetFilter(TargetFilterConfig())
+    out = _run(tf, [(p, None) for p in (5, 3, 5, 4, 5, 3, 1)], social=social, seen=set(social))
+    hyst = _hyst(out)
+    assert hyst[1] is not None and len(set(hyst[1:])) == 1
+
+
+# --- voto continuo: "ema_c" y "bayes" ---------------------------------------
+
+from vlm_hri.social_state import SOCIAL_ENGAGED  # noqa: E402
+from vlm_hri.target_filter import target_evidence  # noqa: E402
+
+
+def _cont(tf, evs, social=None):
+    """evs: lista de {pid: e}; social por defecto AVAILABLE para todos."""
+    out = []
+    for ev in evs:
+        soc = social or {p: AV for p in ev}
+        out.append(tf.update(None, None, soc, set(ev), ev))
+    return out
+
+
+def test_evidence_uses_probs_and_pose_override():
+    probs = {1: {"ATTENTIVE": 0.5, "AVAILABLE": 0.3, "BUSY": 0.2}, 2: {"ATTENTIVE": 0.6, "AVAILABLE": 0.2}}
+    probs[4] = {"ENGAGED": 0.8, "ATTENTIVE": 0.1, "AVAILABLE": 0.05}
+    # pid 2: el modelo dijo ATTENTIVE pero la marcha lo pasó a MOVING; pid 4:
+    # dijo ENGAGED y la mirada lo pasó a ATTENTIVE -> en ambos manda la pose.
+    ev = target_evidence({1: SOCIAL_ATTENTIVE, 2: SOCIAL_MOVING, 3: SOCIAL_ENGAGED, 4: SOCIAL_ATTENTIVE}, probs,
+                         {1: SOCIAL_ATTENTIVE, 2: SOCIAL_ATTENTIVE, 3: SOCIAL_ENGAGED, 4: SOCIAL_ENGAGED})
+    assert ev[1] == pytest.approx(0.8)
+    assert ev[2] == pytest.approx(0.02)
+    assert ev[3] == pytest.approx(0.1)  # sin probabilidades: tabla
+    assert ev[4] == pytest.approx(0.9)
+
+
+def test_ema_c_follows_continuous_evidence():
+    tf = TargetFilter(TargetFilterConfig())
+    out = _cont(tf, [{1: 0.9, 2: 0.3}] * 3)
+    assert [d["ema_c"].pid for d in out] == [None, 1, 1]  # 0.45 < enter, luego 0.675
+
+
+def test_bayes_creates_target_with_consistent_evidence():
+    tf = TargetFilter(TargetFilterConfig())
+    out = _cont(tf, [{1: 0.85, 2: 0.2}] * 4)
+    assert out[-1]["bayes"].pid == 1
+    assert tf.belief[1] > 0.5
+
+
+def test_bayes_no_target_when_nobody_approachable():
+    tf = TargetFilter(TargetFilterConfig())
+    out = _cont(tf, [{1: 0.1, 2: 0.05}] * 5)
+    assert all(d["bayes"].pid is None for d in out)
+
+
+def test_bayes_single_contrary_chunk_does_not_switch():
+    tf = TargetFilter(TargetFilterConfig())
+    out = _cont(tf, [{1: 0.85, 2: 0.3}] * 4 + [{1: 0.3, 2: 0.9}] + [{1: 0.85, 2: 0.3}])
+    assert [d["bayes"].pid for d in out][3:] == [1, 1, 1]
+
+
+def test_bayes_sustained_challenger_switches():
+    tf = TargetFilter(TargetFilterConfig())
+    out = _cont(tf, [{1: 0.85, 2: 0.3}] * 4 + [{1: 0.2, 2: 0.9}] * 6)
+    assert out[-1]["bayes"].pid == 2
+
+
+def test_bayes_moving_releases_immediately():
+    tf = TargetFilter(TargetFilterConfig())
+    _cont(tf, [{1: 0.85}] * 4)
+    d = tf.update(None, None, {1: SOCIAL_MOVING}, {1}, {1: 0.85})
+    assert d["bayes"].pid is None
+
+
+def test_replay_reproduces_continuous_modes():
+    tf = TargetFilter(TargetFilterConfig())
+    recs = []
+    for i, ev in enumerate([{1: 0.85, 2: 0.2}] * 4):
+        soc = {1: AV, 2: AV}
+        d = tf.update(None, None, soc, {1, 2}, ev)
+        recs.append(chunk_record(i, i * 25, None, None, soc, {1, 2}, d, evidence=ev))
+    again = replay(recs, TargetFilterConfig())
+    assert [c["bayes"]["pid"] for c in again] == [c["bayes"]["pid"] for c in recs]
+    assert [c["ema_c"]["pid"] for c in again] == [c["ema_c"]["pid"] for c in recs]

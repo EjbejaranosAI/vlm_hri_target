@@ -42,6 +42,7 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header, String
 
+from ..config import vlm_backend
 from ..motion import strip_posture_prefix
 from ..pose.gait import draw_pose_skeleton
 
@@ -117,11 +118,12 @@ class RosPublisherSink:
         confidence = confidence or {}
         interrupt_cost = interrupt_cost or {}
         pose = pose or {}
+        empty = "unknown" if vlm_backend() == "vlm_jev" else "idle"  # JEV no da acción
         payload = [
             {
                 "id": pid,
                 "pose": pose.get(pid, "unknown"),
-                "action": strip_posture_prefix(actions.get(pid, "unknown")),
+                "action": strip_posture_prefix(actions.get(pid, "unknown"), empty=empty),
                 "social_state": social_states.get(pid, "UNKNOWN"),
                 "confidence": confidence.get(pid),
                 "interrupt_cost": interrupt_cost.get(pid),

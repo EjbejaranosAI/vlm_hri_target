@@ -49,6 +49,12 @@ UI_SCALE_MAX = float(os.environ.get("UI_SCALE_MAX", "1.75"))
 UI_BANNER_FACTOR = float(os.environ.get("UI_BANNER_FACTOR", "0.62"))
 VIDEO_VLM_CHUNK_SEC = float(os.environ.get("VIDEO_VLM_CHUNK_SEC", "1"))
 VLM_ID = os.environ.get("VLM_ID", "Qwen/Qwen2-VL-2B-Instruct")
+# Backend de intención (ver vlm_backend()): modelo JEV-HRI y su cuantización
+# (none | nf4-bnb | int8-bnb | int8-ao | int4-ao, ver jev_hri.engine.load_vlm).
+VLM_JEV_ID = os.environ.get("VLM_JEV_ID", "ejbejaranos/JEV-HRI-Qwen3-VL-2B")
+VLM_JEV_QUANT = os.environ.get("VLM_JEV_QUANT", "none").strip().lower()
+# YAML de preguntas/política, relativo al repo del modelo (v3: configs/hri_intent_v3.yaml).
+VLM_JEV_CONFIG = os.environ.get("VLM_JEV_CONFIG", "configs/hri_intent.yaml")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".avif"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 VLM_DEBUG = os.environ.get("VLM_DEBUG", "0") == "1"
@@ -98,6 +104,25 @@ def vlm_target_source() -> str:
     persona escrita (23/23) -- sesgo de posición, no elección."""
     s = os.environ.get("VLM_TARGET_SOURCE", "rules").strip().lower()
     return s if s in ("rules", "vlm") else "rules"
+
+
+def vlm_backend() -> str:
+    """vlm (default) = VLM generativo (VLM_ID, JSON con acción + intención);
+    vlm_jev = modelo JEV-HRI (VLM_JEV_ID): solo intención, con
+    probabilidades, en un forward por imagen y SIN acciones (ver vlm/jev.py).
+    vlm_jev solo está cableado en el modo pose (nodo ROS2 y `stream` con
+    pose); el resto de runners usan siempre el VLM generativo."""
+    b = os.environ.get("VLM_BACKEND", "vlm").strip().lower()
+    return b if b in ("vlm", "vlm_jev") else "vlm"
+
+
+def vlm_query_mode() -> str:
+    """per_person = una consulta por persona (clip con solo su caja resaltada,
+    todas en un batch); group = una sola consulta con todas las cajas (modo
+    anterior). Medido 2026-10-02 (6 videos, 268 etiquetas a ojo, junto con
+    la mirada por pose): per_person 69% de acierto vs. group 39%."""
+    m = os.environ.get("VLM_QUERY_MODE", "per_person").strip().lower()
+    return m if m in ("per_person", "group") else "per_person"
 
 
 def vlm_motion_hint() -> bool:

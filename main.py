@@ -69,9 +69,10 @@ def main() -> None:
         help="Dibuja el esqueleto de pose también en el video/ventana final (solo con pose activo)",
     )
     p_stream.add_argument(
-        "--target-filter", choices=("raw", "ema", "hyst"), default=None,
-        help="Qué target maneja el overlay: raw (VLM tal cual), ema, hyst (EMA+histéresis). "
-        "Los 3 se calculan y van a summary.json igual. Default: $VLM_TARGET_FILTER o raw",
+        "--target-filter", choices=("raw", "ema", "hyst", "ema_c", "bayes"), default=None,
+        help="Qué target maneja el overlay: raw (VLM tal cual), ema, hyst (EMA+histéresis), "
+        "ema_c (EMA del voto continuo por persona), bayes (filtro de Bayes discreto). "
+        "Todos se calculan y van a summary.json igual. Default: $VLM_TARGET_FILTER o raw",
     )
     p_stream.add_argument("--target-alpha", type=float, default=None, help="EMA alpha (default 0.5)")
     p_stream.add_argument("--target-min-stable", type=int, default=None, help="Trozos seguidos para cambiar (default 2)")
