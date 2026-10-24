@@ -73,6 +73,8 @@ class VlmHriNode(Node):
         self.declare_parameter("fps_calibration_samples", 20)
         self.declare_parameter("use_pose", True)
         self.declare_parameter("draw_pose", False)
+        # /social_states solo lleva a quien se vio en los últimos `social_keep_sec` s
+        self.declare_parameter("social_keep_sec", 10.0)
         self.declare_parameter("sync_slop_sec", 0.10)
         self.declare_parameter("chunk_dir", str(Path.home() / ".ros" / "vlm_hri_chunks"))
         # Filtro temporal del target (ver vlm_hri/target_filter.py): los 3
@@ -106,6 +108,7 @@ class VlmHriNode(Node):
         self._measured_fps: float | None = None
         self._use_pose = bool(self.get_parameter("use_pose").value)
         self._draw_pose = bool(self.get_parameter("draw_pose").value)
+        self._social_keep_sec = float(self.get_parameter("social_keep_sec").value)
         slop = float(self.get_parameter("sync_slop_sec").value)
         self._chunk_dir = Path(str(self.get_parameter("chunk_dir").value))
         self._target_filter = TargetFilterConfig(
@@ -215,6 +218,7 @@ class VlmHriNode(Node):
                     chunk_dir=self._chunk_dir, vlm=self._vlm, processor=self._processor,
                     draw_pose=self._draw_pose, sinks=[sink],
                     target_filter=self._target_filter,
+                    social_keep_sec=self._social_keep_sec,
                 )
                 self._session.start()
                 self.get_logger().info(f"Sesión iniciada ({w}x{h} @ {fps:.2f} fps)")

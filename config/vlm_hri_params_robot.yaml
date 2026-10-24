@@ -24,6 +24,9 @@ vlm_hri_node:
     fps_calibration_samples: 20
     use_pose: true
     draw_pose: false
+    # /vlm_hri/social_states solo lleva a quien se vio en los últimos N s (si no,
+    # salían para siempre personas que ya se fueron)
+    social_keep_sec: 10.0
     sync_slop_sec: 0.10
     # Filtro temporal del target (vlm_hri/target_filter.py). Todos los modos se
     # calculan siempre y salen en /vlm_hri/target_filter (grabar con rosbag

@@ -221,7 +221,7 @@ dynamic_tracking):
 | Tópico | Tipo | Contenido |
 |---|---|---|
 | `/vlm_hri/image_annotated` | `sensor_msgs/Image` | Mismo video anotado que el CLI (cajas, panel, banner) |
-| `/vlm_hri/social_states` | `std_msgs/String` (JSON) | `[{id, action, social_state, map_x, map_y, cluster_id, is_target}, ...]` |
+| `/vlm_hri/social_states` | `std_msgs/String` (JSON) | `[{id, action, social_state, map_x, map_y, cluster_id, is_target}, ...]`: solo personas vistas en los últimos `social_keep_sec` s (10) |
 | `/vlm_hri/target_pose` | `geometry_msgs/PoseStamped` | Posición real del target elegido |
 
 `cluster_id` viene de agrupar personas por distancia real (LiDAR,

@@ -48,3 +48,10 @@ def test_activity_words_that_overlap_social_aliases_stay_as_actions():
     assert coerce_action_social("reading", "B") == ("reading", "B")
     assert coerce_action_social("phone", "UNKNOWN") == ("phone", "UNKNOWN")
     assert coerce_action_social("using phone", SOCIAL_BUSY) == ("using phone", SOCIAL_BUSY)
+
+
+def test_present_pids_drops_people_not_seen_lately():
+    from vlm_hri.runners.pose_session import present_pids
+
+    last_seen = {14: 100, 87: 950, 90: 1000}
+    assert present_pids(last_seen, now_frame=1000, keep_frames=100) == {87, 90}

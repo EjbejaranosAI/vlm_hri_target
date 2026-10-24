@@ -96,6 +96,9 @@ class PoseStreamState:
     pose: dict[int, str] = field(default_factory=dict)
     confidence: dict[int, int] = field(default_factory=dict)
     interrupt_cost: dict[int, int] = field(default_factory=dict)
+    # Último frame en que salió cada pid: a /social_states solo va quien sigue a
+    # la vista (los dicts de arriba no se vacían nunca: personas que ya se fueron).
+    last_seen_frame: dict[int, int] = field(default_factory=dict)
     segment_actions: list[tuple[int, dict[int, str]]] = field(default_factory=list)
     segment_social: list[tuple[int, dict[int, str]]] = field(default_factory=list)
     segment_pose: list[tuple[int, dict[int, str]]] = field(default_factory=list)
@@ -322,6 +325,11 @@ def _collect_world_xy(raw_frames: list[RawFrame]) -> dict[int, tuple[float, floa
     return out
 
 
+def present_pids(last_seen_frame: dict[int, int], now_frame: int, keep_frames: float) -> set[int]:
+    """Pids vistos en los últimos `keep_frames` frames."""
+    return {pid for pid, f in last_seen_frame.items() if now_frame - f <= keep_frames}
+
+
 def _target_in_frame(rf: RawFrame, target_pid: int | None) -> int | None:
     """El target del VLM solo vale en los frames donde esa persona aparece."""
     if target_pid is None or not any(d["pid"] == target_pid for d in rf.dets):
@@ -331,6 +339,12 @@ def _target_in_frame(rf: RawFrame, target_pid: int | None) -> int | None:
 
 def _flush_chunk_to_sinks(job: PoseVlmChunkJob, session: "PoseStreamSession") -> None:
     with session.state.lock:
+        for rf in job.raw_frames:
+            for d in rf.dets:
+                session.state.last_seen_frame[d["pid"]] = rf.frame_i
+        last_frame = job.raw_frames[-1].frame_i if job.raw_frames else job.start_frame
+        present = present_pids(session.state.last_seen_frame, last_frame,
+                               session.social_keep_sec * session.fps)
         actions = dict(session.state.actions)
         social_states = dict(session.state.social_states)
         pose = dict(session.state.pose)
@@ -364,9 +378,10 @@ def _flush_chunk_to_sinks(job: PoseVlmChunkJob, session: "PoseStreamSession") ->
         )
         for sink in session.sinks:
             sink.write_frame(ann)
+    present_social = {pid: st for pid, st in social_states.items() if pid in present}
     for sink in session.sinks:
         sink.write_social_update(
-            actions, social_states, world_xy or None, clusters, target_pid,
+            actions, present_social, world_xy or None, clusters, target_pid,
             confidence=confidence, interrupt_cost=interrupt_cost, pose=pose,
             target_confidence=vlm_target_conf if target_pid is not None else None,
         )
@@ -586,8 +601,12 @@ class PoseStreamSession:
         sinks: list[OutputSink] | None = None,
         target_filter: TargetFilterConfig | None = None,
         max_people: int | None = None,
+        social_keep_sec: float = 10.0,
     ) -> None:
         self.w, self.h, self.fps, self.chunk_sec = w, h, fps, chunk_sec
+        # A /social_states solo van las personas vistas en los últimos
+        # `social_keep_sec` s (el tracker ya las borró si se fueron).
+        self.social_keep_sec = social_keep_sec
         # Cuántas personas (las de caja más grande = más cerca de la cámara)
         # recibe el VLM por trozo -- el resto se dibuja pero no se clasifica
         # ni puede ser target.
