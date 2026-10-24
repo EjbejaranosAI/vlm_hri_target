@@ -69,13 +69,21 @@ def main() -> None:
         help="Dibuja el esqueleto de pose también en el video/ventana final (solo con pose activo)",
     )
     p_stream.add_argument(
-        "--target-filter", choices=("raw", "ema", "hyst", "ema_c", "bayes"), default=None,
+        "--target-filter", choices=("raw", "ema", "hyst", "ema_c", "ema_c_hyst", "bayes", "auto"), default=None,
         help="Qué target maneja el overlay: raw (VLM tal cual), ema, hyst (EMA+histéresis), "
-        "ema_c (EMA del voto continuo por persona), bayes (filtro de Bayes discreto). "
+        "ema_c (EMA del voto continuo por persona), ema_c_hyst (ema_c + histéresis), "
+        "bayes (filtro de Bayes discreto), auto (ema_c_hyst con vlm_jev, hyst con el VLM generativo). "
         "Todos se calculan y van a summary.json igual. Default: $VLM_TARGET_FILTER o raw",
     )
     p_stream.add_argument("--target-alpha", type=float, default=None, help="EMA alpha (default 0.5)")
-    p_stream.add_argument("--target-min-stable", type=int, default=None, help="Trozos seguidos para cambiar (default 2)")
+    p_stream.add_argument(
+        "--target-min-stable", type=int, default=None,
+        help="Trozos como líder para cambiar (default 2), dentro de --target-stable-window",
+    )
+    p_stream.add_argument(
+        "--target-stable-window", type=int, default=None,
+        help="Ventana de trozos para --target-min-stable (default 0 = min_stable, es decir seguidos)",
+    )
 
     args = parser.parse_args()
 
@@ -109,6 +117,7 @@ def main() -> None:
             max_frames=args.max_frames,
             target_filter=TargetFilterConfig.from_env(
                 mode=args.target_filter, alpha=args.target_alpha, min_stable=args.target_min_stable,
+                stable_window=args.target_stable_window,
             ),
         )
 

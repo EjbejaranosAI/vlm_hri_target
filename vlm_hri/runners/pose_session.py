@@ -553,7 +553,8 @@ def _pose_vlm_worker(
             f"gait={sorted(moving_pids)} target[{source}]={raw_pid} vlm={vlm_out.target_pid} p={vlm_out.target_confidence} "
             f"P(t=1)={ {p: round(v, 2) for p, v in vlm_out.target_probs.items()} } "
             f"[ema={decisions['ema'].pid} hyst={decisions['hyst'].pid} ema_c={decisions['ema_c'].pid} "
-            f"bayes={decisions['bayes'].pid} -> {target_filter.cfg.mode}={chosen.pid}] (inferencia {vlm_out.elapsed_s:.2f}s, acum VLM {state.vlm_total_s:.2f}s)",
+            f"ema_c_hyst={decisions['ema_c_hyst'].pid} bayes={decisions['bayes'].pid} "
+            f"-> {target_filter.cfg.resolved_mode()}={chosen.pid}] (inferencia {vlm_out.elapsed_s:.2f}s, acum VLM {state.vlm_total_s:.2f}s)",
             flush=True,
         )
 

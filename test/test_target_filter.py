@@ -109,6 +109,21 @@ def test_attentive_and_available_both_eligible():
     assert _hyst(out)[-1] == 2
 
 
+def test_hyst_k_of_n_survives_single_interruption():
+    # alpha=1: el líder de la EMA es el voto del trozo tal cual. Líderes
+    # 1, 1, None, 1: nunca 3 seguidos, pero sí 3 de los últimos 4.
+    seq = [(1, 1.0), (1, 1.0), (None, None), (1, 1.0)]
+    seguidos = TargetFilter(TargetFilterConfig(alpha=1.0, min_stable=3, fallback_weight=0.0))
+    assert _hyst(_run(seguidos, seq)) == [None] * 4
+    k_de_n = TargetFilter(TargetFilterConfig(alpha=1.0, min_stable=3, stable_window=4, fallback_weight=0.0))
+    assert _hyst(_run(k_de_n, seq)) == [None, None, None, 1]
+
+
+def test_stable_window_below_min_stable_rejected():
+    with pytest.raises(ValueError):
+        TargetFilterConfig(min_stable=3, stable_window=2)
+
+
 def test_invalid_mode_rejected():
     with pytest.raises(ValueError):
         TargetFilterConfig(mode="kalman")
@@ -272,3 +287,52 @@ def test_replay_reproduces_continuous_modes():
     again = replay(recs, TargetFilterConfig())
     assert [c["bayes"]["pid"] for c in again] == [c["bayes"]["pid"] for c in recs]
     assert [c["ema_c"]["pid"] for c in again] == [c["ema_c"]["pid"] for c in recs]
+    assert [c["ema_c_hyst"]["pid"] for c in again] == [c["ema_c_hyst"]["pid"] for c in recs]
+
+
+def _ch(out):
+    return [d["ema_c_hyst"].pid for d in out]
+
+
+def test_ema_c_hyst_enters_holds_below_enter_then_releases():
+    tf = TargetFilter(TargetFilterConfig())
+    # s1: 0.45 (< enter), 0.675, 0.7875 -> líder 2 trozos -> entra en el 3º.
+    out = _cont(tf, [{1: 0.9, 2: 0.3}] * 3)
+    assert _ch(out) == [None, None, 1]
+    # s1 = 0.49: ema_c lo pierde (< enter), ema_c_hyst lo conserva (>= exit).
+    d = _cont(tf, [{1: 0.2, 2: 0.3}])[0]
+    assert (d["ema_c"].pid, d["ema_c_hyst"].pid) == (None, 1)
+    # s1 = 0.247 < exit -> se suelta.
+    assert _ch(_cont(tf, [{1: 0.0, 2: 0.3}])) == [None]
+
+
+def test_ema_c_hyst_single_better_chunk_does_not_steal():
+    tf = TargetFilter(TargetFilterConfig())
+    _cont(tf, [{1: 0.9, 2: 0.3}] * 3)
+    out = _cont(tf, [{1: 0.3, 2: 1.0}] + [{1: 0.9, 2: 0.3}])
+    assert out[0]["ema_c"].pid == 2  # ema_c sí salta
+    assert _ch(out) == [1, 1]
+
+
+def test_ema_c_hyst_sustained_challenger_switches():
+    tf = TargetFilter(TargetFilterConfig())
+    _cont(tf, [{1: 0.9, 2: 0.3}] * 3)
+    assert _ch(_cont(tf, [{1: 0.3, 2: 1.0}] * 2)) == [1, 2]
+
+
+def test_ema_c_hyst_moving_releases_immediately():
+    tf = TargetFilter(TargetFilterConfig())
+    _cont(tf, [{1: 0.9}] * 3)
+    d = tf.update(None, None, {1: SOCIAL_MOVING}, {1}, {1: 0.9})
+    assert d["ema_c_hyst"].pid is None
+
+
+def test_auto_mode_follows_backend(monkeypatch):
+    cfg = TargetFilterConfig(mode="auto")
+    monkeypatch.setenv("VLM_BACKEND", "vlm_jev")
+    assert cfg.resolved_mode() == "ema_c_hyst"
+    monkeypatch.setenv("VLM_BACKEND", "vlm")
+    assert cfg.resolved_mode() == "hyst"
+    tf = TargetFilter(cfg)
+    d = tf.update(1, 0.9, {1: AV}, {1}, {1: 0.9})
+    assert tf.selected(d) is d["hyst"]

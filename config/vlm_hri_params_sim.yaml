@@ -19,18 +19,24 @@ vlm_hri_node:
     use_pose: true
     draw_pose: false
     sync_slop_sec: 0.10
-    # Filtro temporal del target (vlm_hri/target_filter.py). Los 3 modos se
+    # Filtro temporal del target (vlm_hri/target_filter.py). Todos los modos se
     # calculan siempre y salen en /vlm_hri/target_filter (grabar con rosbag
     # para comparar); target_filter elige cuál va a /vlm_hri/target_pose:
     #   raw  = target del VLM tal cual, trozo a trozo (comportamiento previo)
     #   ema  = argmax de la EMA de votos (incluye "nadie" como clase)
-    #   hyst = EMA + histéresis (cambia tras min_stable trozos y > enter;
-    #          suelta si < exit, si pasa a MOVING o si no se ve > absent_chunks)
+    #   hyst = EMA + histéresis (cambia si es líder en min_stable de los últimos
+    #          stable_window trozos y > enter; suelta si < exit, si pasa a
+    #          MOVING o si no se ve > absent_chunks)
+    #   ema_c      = EMA por persona de P(ATTENTIVE)+P(AVAILABLE) (JEV)
+    #   ema_c_hyst = ema_c + la misma histéresis
+    #   bayes      = filtro de Bayes discreto sobre la misma evidencia
+    #   auto       = ema_c_hyst con VLM_BACKEND=vlm_jev, hyst con el VLM generativo
     target_filter: "raw"
     target_ema_alpha: 0.5
     target_enter_threshold: 0.5
     target_exit_threshold: 0.25
     target_min_stable: 2
+    target_stable_window: 0   # 0 = min_stable (seguidos); p. ej. 4 = 2 de los últimos 4
     target_absent_chunks: 2
     # Si el VLM dice target=null pero él mismo marcó a alguien ATTENTIVE/
     # AVAILABLE (se contradice), se vota por ese pid con este peso en vez de

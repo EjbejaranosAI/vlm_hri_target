@@ -965,9 +965,9 @@ def _run_pose(
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     vname = video_path.name if video_path else f"camera_{camera}"
     video_io.print_vlm_latency_report(vname, vlm_chunk_timings)
-    print(f"  Target (modo activo: {target_filter.mode}):", flush=True)
+    print(f"  Target (modo activo: {target_filter.resolved_mode()}):", flush=True)
     for mode, m in summary["target_filter"]["metrics"].items():
-        print(f"    {mode:5s} {m}", flush=True)
+        print(f"    {mode:10s} {m}", flush=True)
     print(
         f"\nStream [pose] listo → {out} ({pipeline_total_s:.1f}s, {frame_i} frames, "
         f"VLM {vlm_calls} trozos, factor RT {rt['realtime_factor']:.2f}x)",

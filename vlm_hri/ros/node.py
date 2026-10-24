@@ -85,6 +85,7 @@ class VlmHriNode(Node):
         self.declare_parameter("target_enter_threshold", tf_default.enter_threshold)
         self.declare_parameter("target_exit_threshold", tf_default.exit_threshold)
         self.declare_parameter("target_min_stable", tf_default.min_stable)
+        self.declare_parameter("target_stable_window", tf_default.stable_window)
         self.declare_parameter("target_absent_chunks", tf_default.absent_chunks)
         self.declare_parameter("target_fallback_weight", tf_default.fallback_weight)
 
@@ -118,10 +119,13 @@ class VlmHriNode(Node):
             enter_threshold=float(self.get_parameter("target_enter_threshold").value),
             exit_threshold=float(self.get_parameter("target_exit_threshold").value),
             min_stable=int(self.get_parameter("target_min_stable").value),
+            stable_window=int(self.get_parameter("target_stable_window").value),
             absent_chunks=int(self.get_parameter("target_absent_chunks").value),
             fallback_weight=float(self.get_parameter("target_fallback_weight").value),
         )
-        self.get_logger().info(f"Filtro de target: {self._target_filter}")
+        self.get_logger().info(
+            f"Filtro de target: {self._target_filter} -> modo activo {self._target_filter.resolved_mode()}"
+        )
 
         self._bridge = CvBridge()
         self._device = resolve_device()

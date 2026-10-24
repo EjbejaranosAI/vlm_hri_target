@@ -21,9 +21,11 @@ a) EMA por "clase" -- cada pid visto + `None` ("nadie es apto") como una
    CREAR uno (>= enter); sí puede completar la racha de min_stable que
    empezó un voto real. 0 = desactivado (todo a `None`, como antes).
        s_t = alpha * p_t + (1 - alpha) * s_{t-1}
-b) Histéresis -- el target solo cambia cuando un candidato (o `None`) lleva
-   `min_stable` trozos SEGUIDOS como líder de la EMA y su score supera
-   `enter_threshold`. El target actual se suelta antes si su score cae por
+b) Histéresis -- el target solo cambia cuando un candidato (o `None`) ha
+   sido líder de la EMA en al menos `min_stable` de los últimos
+   `stable_window` trozos (0 = min_stable, es decir, `min_stable` SEGUIDOS)
+   y su score supera `enter_threshold`. Con ventana > min_stable un voto
+   suelto no reinicia la cuenta. El target actual se suelta antes si su score cae por
    debajo de `exit_threshold` (umbral de salida < entrada), si pasa a
    MOVING (salida rápida: no acercarse a alguien que se va) o si lleva más
    de `absent_chunks` trozos sin verse.
@@ -37,6 +39,10 @@ c) Voto continuo -- cada persona vista aporta una evidencia e_i en [0, 1]
    P(ATTENTIVE)+P(AVAILABLE) del modelo; con el VLM generativo, una tabla
    por estado ya refinado), no solo el ganador del trozo:
    - "ema_c": EMA por persona de e_i; target = argmax si >= enter_threshold.
+   - "ema_c_hyst": la misma EMA por persona + histéresis (como b) pero
+     sobre probabilidades en vez de votos duros): entra con >= enter, se
+     suelta con < exit o MOVING, y otra persona solo lo roba si es líder en
+     `min_stable` de los últimos `stable_window` trozos y >= enter.
    - "bayes": filtro de Bayes discreto (el caso exacto de un filtro de
      partículas cuando la hipótesis es finita): b(h) sobre
      h in {nadie, pid_1..pid_n}. Predicción: b <- stay*b + (1-stay)/|H|
@@ -48,8 +54,11 @@ c) Voto continuo -- cada persona vista aporta una evidencia e_i en [0, 1]
      `min_stable` trozos seguidos (con varias personas igual de abordables
      la masa se reparte y el argmax solo cambiaría por ruido).
 
-Todos los modos ("raw", "ema", "hyst", "ema_c", "bayes") se calculan SIEMPRE en paralelo sobre la
-misma secuencia de votos -- `mode` solo decide cuál maneja al robot/overlay.
+Todos los modos ("raw", "ema", "hyst", "ema_c", "ema_c_hyst", "bayes") se calculan SIEMPRE en
+paralelo sobre la misma secuencia de votos -- `mode` solo decide cuál maneja al robot/overlay.
+`mode="auto"` elige según VLM_BACKEND: "ema_c_hyst" con vlm_jev (tiene
+probabilidades calibradas por persona), "hyst" con el VLM generativo (solo
+etiquetas, votos duros).
 Así una sola corrida da la comparación sin el ruido de que el VLM no es
 determinista entre corridas. `replay()` re-simula offline con otros
 parámetros a partir de los votos guardados en summary.json:
@@ -60,6 +69,7 @@ parámetros a partir de los votos guardados en summary.json:
 from __future__ import annotations
 
 import os
+from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 
 from .social_state import (
@@ -71,7 +81,9 @@ from .social_state import (
     SOCIAL_UNKNOWN,
 )
 
-TARGET_FILTER_MODES = ("raw", "ema", "hyst", "ema_c", "bayes")
+TARGET_FILTER_MODES = ("raw", "ema", "hyst", "ema_c", "ema_c_hyst", "bayes")
+# Valores válidos de `mode`: los calculados + "auto" (se resuelve por backend).
+TARGET_FILTER_CHOICES = TARGET_FILTER_MODES + ("auto",)
 TARGET_SOURCES = ("rules", "vlm")
 _ELIGIBLE = {SOCIAL_ATTENTIVE, SOCIAL_AVAILABLE}
 # Evidencia de "es abordable" cuando no hay probabilidades del modelo (VLM
@@ -118,7 +130,7 @@ _CHALLENGER_RUN = 2
 
 @dataclass(frozen=True)
 class TargetFilterConfig:
-    mode: str = "raw"  # cuál de los 3 modos maneja al robot (los 3 se calculan igual)
+    mode: str = "raw"  # cuál de los modos maneja al robot (todos se calculan igual); "auto" = por backend
     # De dónde sale el voto crudo de cada trozo: "rules" = pick_interaction_target
     # sobre las etiquetas 's' (ATTENTIVE > AVAILABLE > más cercano); "vlm" =
     # el target que eligió el propio VLM (flag "t"). Debe coincidir con
@@ -129,14 +141,20 @@ class TargetFilterConfig:
     enter_threshold: float = 0.5
     exit_threshold: float = 0.25
     min_stable: int = 2
+    # "hyst"/"ema_c_hyst": min_stable de los últimos stable_window trozos (0 = min_stable, seguidos).
+    stable_window: int = 0
     absent_chunks: int = 2
     fallback_weight: float = 0.5  # voto por el mejor elegible si el VLM dice null (0 = off)
     bayes_stay: float = 0.9  # "bayes": P(el target real sigue siendo el mismo entre trozos)
     bayes_margin: float = 0.1  # "bayes": ventaja en b() que necesita un retador para robar el target
 
     def __post_init__(self) -> None:
-        if self.mode not in TARGET_FILTER_MODES:
-            raise ValueError(f"target_filter mode={self.mode!r}, debe ser uno de {TARGET_FILTER_MODES}")
+        if self.mode not in TARGET_FILTER_CHOICES:
+            raise ValueError(f"target_filter mode={self.mode!r}, debe ser uno de {TARGET_FILTER_CHOICES}")
+        if self.stable_window and self.stable_window < self.min_stable:
+            raise ValueError(
+                f"target_filter stable_window={self.stable_window} < min_stable={self.min_stable} (0 = min_stable)"
+            )
         if self.source not in TARGET_SOURCES:
             raise ValueError(f"target_filter source={self.source!r}, debe ser uno de {TARGET_SOURCES}")
         if not 0.0 < self.alpha <= 1.0:
@@ -158,12 +176,26 @@ class TargetFilterConfig:
             enter_threshold=float(env("VLM_TARGET_ENTER", cls.enter_threshold)),
             exit_threshold=float(env("VLM_TARGET_EXIT", cls.exit_threshold)),
             min_stable=int(env("VLM_TARGET_MIN_STABLE", cls.min_stable)),
+            stable_window=int(env("VLM_TARGET_STABLE_WINDOW", cls.stable_window)),
             absent_chunks=int(env("VLM_TARGET_ABSENT_CHUNKS", cls.absent_chunks)),
             fallback_weight=float(env("VLM_TARGET_FALLBACK_WEIGHT", cls.fallback_weight)),
             bayes_stay=float(env("VLM_TARGET_BAYES_STAY", cls.bayes_stay)),
             bayes_margin=float(env("VLM_TARGET_BAYES_MARGIN", cls.bayes_margin)),
         )
         return replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+
+    @property
+    def window(self) -> int:
+        return self.stable_window or self.min_stable
+
+    def resolved_mode(self) -> str:
+        """`mode` con "auto" resuelto: probabilidades por persona con JEV,
+        votos duros con el VLM generativo."""
+        if self.mode != "auto":
+            return self.mode
+        from .config import vlm_backend  # perezoso: config importa torch/cv2
+
+        return "ema_c_hyst" if vlm_backend() == "vlm_jev" else "hyst"
 
 
 @dataclass(frozen=True)
@@ -179,13 +211,16 @@ class TargetFilter:
     scores: dict[int | None, float] = field(default_factory=lambda: {None: 0.0})
     _absent: dict[int, int] = field(default_factory=dict)
     _current: int | None = None
-    _streak_key: int | None = None
-    _streak_n: int = 0
+    # Líderes de la EMA de los últimos `cfg.window` trozos (histéresis K de N).
+    _leaders: deque = field(default_factory=deque)
     _raw_last: int | None = None
     _raw_run: int = 0
     # "ema_c": EMA de la evidencia continua por persona.
     cscores: dict[int, float] = field(default_factory=dict)
     _c_absent: dict[int, int] = field(default_factory=dict)
+    # "ema_c_hyst": histéresis sobre cscores.
+    _ch_current: int | None = None
+    _ch_leaders: deque = field(default_factory=deque)
     # "bayes": creencia sobre quién es el target (None = nadie).
     belief: dict[int | None, float] = field(default_factory=lambda: {None: 1.0})
     _b_absent: dict[int, int] = field(default_factory=dict)
@@ -287,6 +322,34 @@ class TargetFilter:
             return TargetDecision(None, None)
         return TargetDecision(leader, self.cscores[leader])
 
+    def _push_leader(self, leaders: deque, leader: int | None) -> int:
+        """Añade el líder de este trozo a la ventana y devuelve cuántas veces
+        fue líder en los últimos `cfg.window` trozos (K de N)."""
+        leaders.append(leader)
+        while len(leaders) > self.cfg.window:
+            leaders.popleft()
+        return leaders.count(leader)
+
+    def _update_ema_c_hyst(self, social_states: dict[int, str], seen: set[int]) -> TargetDecision:
+        """Histéresis sobre `cscores` (ya actualizados por _update_ema_c)."""
+        s = self.cscores
+
+        def moving(p: int) -> bool:
+            return p in seen and social_states.get(p) == SOCIAL_MOVING
+
+        pids = [p for p in s if not moving(p)]
+        leader = min(pids, key=lambda p: (-s[p], p)) if pids else None
+        if leader is not None and s[leader] < self.cfg.enter_threshold:
+            leader = None  # nadie llega a enter: cuenta como trozo sin candidato
+        n = self._push_leader(self._ch_leaders, leader)
+        cur = self._ch_current
+        if cur is not None and (cur not in s or s[cur] < self.cfg.exit_threshold or moving(cur)):
+            cur = None
+        if leader is not None and leader != cur and n >= self.cfg.min_stable:
+            cur = leader
+        self._ch_current = cur
+        return TargetDecision(cur, s[cur] if cur is not None else None)
+
     def _update_bayes(
         self, evidence: dict[int, float], social_states: dict[int, str], seen: set[int]
     ) -> TargetDecision:
@@ -360,10 +423,7 @@ class TargetFilter:
         leader = self._leader()
         ema = TargetDecision(leader, self.scores[leader] if leader is not None else None)
 
-        if leader == self._streak_key:
-            self._streak_n += 1
-        else:
-            self._streak_key, self._streak_n = leader, 1
+        stable_n = self._push_leader(self._leaders, leader)
 
         cur = self._current
         if cur is not None and (
@@ -374,23 +434,25 @@ class TargetFilter:
             cur = None
         if (
             leader != cur
-            and self._streak_n >= self.cfg.min_stable
+            and stable_n >= self.cfg.min_stable
             and self.scores[leader] >= self.cfg.enter_threshold
         ):
             cur = leader
         self._current = cur
         hyst = TargetDecision(cur, self.scores[cur] if cur is not None else None)
 
+        ema_c = self._update_ema_c(evidence, seen)  # antes que ema_c_hyst: actualiza cscores
         return {
             "raw": TargetDecision(raw_pid, raw_conf),
             "ema": ema,
             "hyst": hyst,
-            "ema_c": self._update_ema_c(evidence, seen),
+            "ema_c": ema_c,
+            "ema_c_hyst": self._update_ema_c_hyst(social_states, seen),
             "bayes": self._update_bayes(evidence, social_states, seen),
         }
 
     def selected(self, decisions: dict[str, TargetDecision]) -> TargetDecision:
-        return decisions[self.cfg.mode]
+        return decisions[self.cfg.resolved_mode()]
 
 
 def chunk_record(
@@ -492,6 +554,7 @@ def _main() -> None:
     p.add_argument("--enter", type=float, dest="enter_threshold")
     p.add_argument("--exit", type=float, dest="exit_threshold")
     p.add_argument("--min-stable", type=int)
+    p.add_argument("--stable-window", type=int)
     p.add_argument("--absent-chunks", type=int)
     p.add_argument("--fallback-weight", type=float)
     p.add_argument("--bayes-stay", type=float)
@@ -508,10 +571,10 @@ def _main() -> None:
     res = summarize(chunks, cfg, float(summary.get("chunk_sec", 1.0)))
     print(json.dumps(res["config"]))
     for mode, m in res["metrics"].items():
-        print(f"  {mode:5s} {m}")
-    print("  trozo  " + " ".join(f"{m:5s}" for m in TARGET_FILTER_MODES))
+        print(f"  {mode:10s} {m}")
+    print("  trozo  " + " ".join(f"{m:10s}" for m in TARGET_FILTER_MODES))
     for c in chunks:
-        print(f"  {c['chunk_index']:5d}  " + " ".join(f"{c[m]['pid']!s:5s}" for m in TARGET_FILTER_MODES))
+        print(f"  {c['chunk_index']:5d}  " + " ".join(f"{c[m]['pid']!s:10s}" for m in TARGET_FILTER_MODES))
 
 
 if __name__ == "__main__":
