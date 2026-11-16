@@ -13,7 +13,11 @@ paquete de interfaces propio para esta v1):
   [{"id": 7, "pose": "sitting", "action": "talking", "social_state": "ENGAGED",
     "confidence": 2, "interrupt_cost": 1,
     "map_x": 1.2, "map_y": 3.4, "cluster_id": 0, "is_target": false,
-    "target_confidence": null}, ...]
+    "target_confidence": null,
+    "probs": {"ATTENTIVE": 0.1, "AVAILABLE": 0.7, ...}, "p_open": 0.8}, ...]
+`probs` / `p_open` solo con VLM_BACKEND=vlm_jev: P(estado) del modelo tal como sale
+(antes del refinado por marcha y mirada que da `social_state`) y P(open_to_interact);
+null con el VLM generativo.
 
 `pose` ("sitting"/"standing"/"walking"/"lying"/"unknown") viene 100% de
 geometría de pose (ángulo real de rodilla + marcha confirmada, ver
@@ -112,7 +116,11 @@ class RosPublisherSink:
         interrupt_cost: dict[int, int] | None = None,
         pose: dict[int, str] | None = None,
         target_confidence: float | None = None,
+        social_probs: dict[int, dict[str, float]] | None = None,
+        target_probs: dict[int, float] | None = None,
     ) -> None:
+        social_probs = social_probs or {}
+        target_probs = target_probs or {}
         world_xy = world_xy or {}
         clusters = clusters or {}
         confidence = confidence or {}
@@ -132,6 +140,11 @@ class RosPublisherSink:
                 "cluster_id": clusters.get(pid),
                 "is_target": pid == target_pid,
                 "target_confidence": target_confidence if pid == target_pid else None,
+                # solo JEV: P(estado) del modelo (antes del refinado por marcha/mirada)
+                # y P(open_to_interact); null con el VLM generativo
+                "probs": ({k: round(float(v), 4) for k, v in social_probs[pid].items()}
+                          if pid in social_probs else None),
+                "p_open": round(float(target_probs[pid]), 4) if pid in target_probs else None,
             }
             for pid in social_states
         ]

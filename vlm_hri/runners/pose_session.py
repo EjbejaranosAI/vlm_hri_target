@@ -96,6 +96,10 @@ class PoseStreamState:
     pose: dict[int, str] = field(default_factory=dict)
     confidence: dict[int, int] = field(default_factory=dict)
     interrupt_cost: dict[int, int] = field(default_factory=dict)
+    # Solo JEV: P(estado) por persona tal como sale del modelo (antes del refinado por
+    # marcha/mirada) y P(open_to_interact); van a /social_states (`probs`, `p_open`)
+    social_probs: dict[int, dict[str, float]] = field(default_factory=dict)
+    target_probs: dict[int, float] = field(default_factory=dict)
     # Último frame en que salió cada pid: a /social_states solo va quien sigue a
     # la vista (los dicts de arriba no se vacían nunca: personas que ya se fueron).
     last_seen_frame: dict[int, int] = field(default_factory=dict)
@@ -141,6 +145,8 @@ class OutputSink(Protocol):
         interrupt_cost: dict[int, int] | None = None,
         pose: dict[int, str] | None = None,
         target_confidence: float | None = None,
+        social_probs: dict[int, dict[str, float]] | None = None,
+        target_probs: dict[int, float] | None = None,
     ) -> None: ...
 
 
@@ -350,6 +356,8 @@ def _flush_chunk_to_sinks(job: PoseVlmChunkJob, session: "PoseStreamSession") ->
         pose = dict(session.state.pose)
         confidence = dict(session.state.confidence)
         interrupt_cost = dict(session.state.interrupt_cost)
+        social_probs = dict(session.state.social_probs)
+        target_probs = dict(session.state.target_probs)
         vlm_target = session.state.vlm_target
         vlm_target_conf = session.state.vlm_target_conf
         target_rec = session.state.segment_target_filter[-1] if session.state.segment_target_filter else None
@@ -384,6 +392,7 @@ def _flush_chunk_to_sinks(job: PoseVlmChunkJob, session: "PoseStreamSession") ->
             actions, present_social, world_xy or None, clusters, target_pid,
             confidence=confidence, interrupt_cost=interrupt_cost, pose=pose,
             target_confidence=vlm_target_conf if target_pid is not None else None,
+            social_probs=social_probs, target_probs=target_probs,
         )
         write_debug = getattr(sink, "write_target_debug", None)
         if write_debug is not None and target_rec is not None:
@@ -542,6 +551,10 @@ def _pose_vlm_worker(
                 state.confidence[pid] = c
             for pid, c in cost.items():
                 state.interrupt_cost[pid] = c
+            for pid, pr in (vlm_out.social_probs or {}).items():
+                state.social_probs[pid] = dict(pr)
+            for pid, p in (vlm_out.target_probs or {}).items():
+                state.target_probs[pid] = float(p)
             state.segment_actions.append((job.start_frame, dict(acts)))
             state.segment_social.append((job.start_frame, dict(social)))
             state.segment_pose.append((job.start_frame, dict(pose)))
